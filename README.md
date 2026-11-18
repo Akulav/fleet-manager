@@ -34,10 +34,11 @@ the LAN even when IP addresses change.
 - **Remote install / uninstall** — push an installer (`.exe`/`.msi`) from the
   master and run it **silently as admin**, or install from a URL. No more walking
   to every desk to type your admin password for the next MSign update.
+  URL installs are **https-only**; runs time out after 60 minutes.
 - **PowerShell as admin** — run a script on one machine or **all online machines**
-  at once; output comes back to the console.
+  at once (with a confirmation); output comes back to the console.
 - **Screenshots & live view** — capture the screen on demand or stream it. The
-  user is notified when a live session starts.
+  agent notifies the user for every screenshot and when a live view starts.
 - **Hardened transport** — TLS with certificate pinning + a shared enrollment
   secret, so agents trust only *your* master.
 - **Always-on agent** — runs as a LocalSystem Windows service, auto-starts at

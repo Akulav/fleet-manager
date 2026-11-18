@@ -18,19 +18,27 @@ fn main() -> eframe::Result<()> {
     let settings = match settings::MasterSettings::load_or_create() {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("failed to initialise master settings: {e:#}");
+            tracing::error!("failed to initialise master settings: {e:#}");
+            // Release builds have no console, so show the error.
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("FleetView — cannot start")
+                .set_description(format!("Failed to initialise master settings:\n\n{e:#}"))
+                .show();
             std::process::exit(1);
         }
     };
 
     // Seed shared state with every agent we have ever seen (as offline).
-    let shared = Shared::new(settings.master_name.clone(), settings.control_port);
+    let shared = Shared::new(settings.master_name.clone());
     let state: SharedState = Arc::new(Mutex::new(shared));
     {
         let mut s = state.lock().unwrap();
         for known in state::load_known() {
-            s.agents
-                .insert(known.agent_id.clone(), state::AgentView::offline_from(&known));
+            s.agents.insert(
+                known.agent_id.clone(),
+                state::AgentView::offline_from(&known),
+            );
         }
         s.log("master started");
     }

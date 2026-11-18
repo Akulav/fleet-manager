@@ -1,9 +1,9 @@
 //! Authenticated loopback IPC between the LocalSystem service and the
 //! user-session helper process.
 //!
-//! The service listens on `127.0.0.1:<random port>` and writes the port plus a
-//! random token to `status.json` (ACL-restricted). The helper reads that file,
-//! connects, and proves it with the token. After that:
+//! The service listens on `127.0.0.1:<random port>` and passes the port plus a
+//! random token to the helper on its command line (see `session.rs`). The
+//! helper connects and proves itself with the token. After that:
 //!
 //!   service -> helper : [`HelperCommand`]  (capture a screenshot, stream,
 //!                        notify the user, ...)
@@ -26,31 +26,45 @@ use crate::paths;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelperCommand {
-    CaptureOnce { command_id: String },
-    StartStream { interval_ms: u64, jpeg_quality: u8 },
+    CaptureOnce {
+        command_id: String,
+    },
+    StartStream {
+        interval_ms: u64,
+        jpeg_quality: u8,
+    },
     StopStream,
-    Notify { title: String, body: String },
-    ShowSplash,
+    Notify {
+        title: String,
+        body: String,
+    },
     /// Connection status pushed to the helper so it can update the tray tooltip.
-    Status { connected: bool, master_name: String },
+    Status {
+        connected: bool,
+        master_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HelperEvent {
-    Hello { username: String },
+    Hello {
+        username: String,
+    },
     ScreenFrame {
         command_id: Option<String>,
         width: u32,
         height: u32,
         jpeg: serde_bytes::ByteBuf,
     },
-    Log { level: String, message: String },
+    Log {
+        level: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusFile {
     pub ipc_port: u16,
-    pub ipc_token: String,
     pub connected: bool,
     pub master_name: String,
 }
@@ -109,25 +123,13 @@ impl Hub {
     }
 
     async fn write_status(&self) -> anyhow::Result<()> {
-        // Preserve the port already written (if any) by reading it back; the
-        // listener writes the authoritative port in `serve`.
-        let port = read_status().map(|s| s.ipc_port).unwrap_or(0);
         let status = StatusFile {
-            ipc_port: port,
-            ipc_token: self.0.token.clone(),
-            connected: self
-                .0
-                .connected
-                .load(std::sync::atomic::Ordering::Relaxed),
+            ipc_port: self.port(),
+            connected: self.0.connected.load(std::sync::atomic::Ordering::Relaxed),
             master_name: self.0.master_name.lock().await.clone(),
         };
         write_status(&status)
     }
-}
-
-pub fn read_status() -> Option<StatusFile> {
-    let text = std::fs::read_to_string(paths::status_path()).ok()?;
-    serde_json::from_str(&text).ok()
 }
 
 pub fn write_status(status: &StatusFile) -> anyhow::Result<()> {
@@ -142,14 +144,11 @@ pub async fn serve(hub: Hub, shutdown: CancellationToken) -> anyhow::Result<()> 
         .await
         .context("bind loopback ipc")?;
     let port = listener.local_addr()?.port();
-    hub.0
-        .port
-        .store(port, std::sync::atomic::Ordering::Relaxed);
+    hub.0.port.store(port, std::sync::atomic::Ordering::Relaxed);
 
     // Publish the port + token so the helper can connect.
     write_status(&StatusFile {
         ipc_port: port,
-        ipc_token: hub.0.token.clone(),
         connected: false,
         master_name: String::new(),
     })?;
@@ -182,27 +181,40 @@ async fn handle_helper(
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     stream.set_nodelay(true).ok();
+    // Any local process can connect to the loopback port, so keep the
+    // unauthenticated phase small and short.
     let mut framed = Framed::new(
         stream,
         LengthDelimitedCodec::builder()
-            .max_frame_length(fleetview_shared::MAX_FRAME_BYTES)
+            .max_frame_length(1024)
             .new_codec(),
     );
 
     // First frame must be the auth token.
-    let first = framed
-        .next()
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), framed.next())
         .await
+        .context("helper auth timed out")?
         .context("helper closed before auth")??;
     let presented = String::from_utf8_lossy(&first);
     if !fleetview_shared::crypto::secrets_match(presented.trim(), &hub.0.token) {
         anyhow::bail!("helper presented bad token");
     }
     tracing::info!("helper authenticated");
+    framed
+        .codec_mut()
+        .set_max_frame_length(fleetview_shared::MAX_FRAME_BYTES);
 
     let mut rx_cmd = hub.0.to_helper.subscribe();
-    // Ask the helper to show the splash as soon as it attaches.
-    hub.send_to_helper(HelperCommand::ShowSplash);
+    // Status is only broadcast on change, so a helper that attaches after we
+    // connected to the master would otherwise show "searching" forever. Send
+    // it the current state directly (the helper shows the splash by itself).
+    let status = HelperCommand::Status {
+        connected: hub.0.connected.load(std::sync::atomic::Ordering::Relaxed),
+        master_name: hub.0.master_name.lock().await.clone(),
+    };
+    framed
+        .send(bytes::Bytes::from(rmp_serde::to_vec_named(&status)?))
+        .await?;
 
     loop {
         tokio::select! {

@@ -24,6 +24,11 @@ pub struct Strings {
     pub running_title: &'static str,
     pub running_body: &'static str,
     pub about_text: &'static str,
+    pub view_title: &'static str,
+    pub live_view_started: &'static str,
+    pub live_view_stopped: &'static str,
+    pub screenshot_taken: &'static str,
+    pub tooltip_viewing: &'static str,
 }
 
 pub fn strings(lang: Lang) -> Strings {
@@ -40,6 +45,11 @@ pub fn strings(lang: Lang) -> Strings {
             running_title: "FleetView",
             running_body: "Agentul rulează pe acest computer.",
             about_text: "FleetView Agent\nAdministrare la distanță a stației.\nRealizat de Akulav.",
+            view_title: "FleetView — asistență la distanță",
+            live_view_started: "Un administrator a început vizualizarea acestui ecran.",
+            live_view_stopped: "Vizualizarea ecranului de către administrator s-a încheiat.",
+            screenshot_taken: "Un administrator a făcut o captură a acestui ecran.",
+            tooltip_viewing: "FleetView — ecranul este vizualizat de un administrator",
         },
         Lang::En => Strings {
             tooltip_connected: "FleetView — connected to",
@@ -53,6 +63,11 @@ pub fn strings(lang: Lang) -> Strings {
             running_title: "FleetView",
             running_body: "The agent is running on this computer.",
             about_text: "FleetView Agent\nRemote workstation management.\nMade by Akulav.",
+            view_title: "FleetView — remote support",
+            live_view_started: "An administrator has started viewing this screen.",
+            live_view_stopped: "The administrator has stopped viewing this screen.",
+            screenshot_taken: "An administrator took a screenshot of this screen.",
+            tooltip_viewing: "FleetView — screen is being viewed by an administrator",
         },
     }
 }

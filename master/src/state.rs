@@ -64,18 +64,16 @@ pub struct Shared {
     pub agents: BTreeMap<String, AgentView>,
     pub events: VecDeque<String>,
     pub master_name: String,
-    pub control_port: u16,
     pub listening: bool,
     pub listen_error: Option<String>,
 }
 
 impl Shared {
-    pub fn new(master_name: String, control_port: u16) -> Self {
+    pub fn new(master_name: String) -> Self {
         Self {
             agents: BTreeMap::new(),
             events: VecDeque::new(),
             master_name,
-            control_port,
             listening: false,
             listen_error: None,
         }
@@ -128,6 +126,38 @@ pub fn save_known(state: &Shared) {
         })
         .collect();
     if let Ok(text) = serde_json::to_string_pretty(&list) {
-        let _ = std::fs::write(crate::paths::known_agents_path(), text);
+        let path = crate::paths::known_agents_path();
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, text).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
+/// Append to a bounded text buffer, trimming from the front on a UTF-8 char
+/// boundary (a byte-index `split_off` panics in the middle of a multi-byte
+/// character such as Romanian diacritics).
+pub fn push_bounded(buf: &mut String, text: &str, max: usize) {
+    buf.push_str(text);
+    if buf.len() > max {
+        let mut cut = buf.len() - max;
+        while !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.drain(..cut);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::push_bounded;
+
+    #[test]
+    fn push_bounded_never_splits_chars() {
+        let mut s = String::new();
+        for _ in 0..1000 {
+            push_bounded(&mut s, "ăîșțâ", 101);
+            assert!(s.len() <= 101);
+        }
     }
 }

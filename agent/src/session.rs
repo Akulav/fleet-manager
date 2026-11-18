@@ -15,12 +15,10 @@ use windows::Win32::Security::{
     DuplicateTokenEx, SecurityIdentification, TokenPrimary, TOKEN_ALL_ACCESS,
 };
 use windows::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
-use windows::Win32::System::RemoteDesktop::{
-    WTSGetActiveConsoleSessionId, WTSQueryUserToken,
-};
+use windows::Win32::System::RemoteDesktop::{WTSGetActiveConsoleSessionId, WTSQueryUserToken};
 use windows::Win32::System::Threading::{
-    CreateProcessAsUserW, GetExitCodeProcess, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT,
-    PROCESS_INFORMATION, STARTUPINFOW,
+    CreateProcessAsUserW, GetExitCodeProcess, TerminateProcess, CREATE_NEW_CONSOLE,
+    CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION, STARTUPINFOW,
 };
 
 /// Owns a HANDLE and closes it on drop.
@@ -55,6 +53,9 @@ pub async fn helper_supervisor(hub: crate::ipc::Hub, shutdown: CancellationToken
     }
     let ipc_port = hub.port();
     let ipc_token = hub.0.token.clone();
+    // Last launch error, so we log it once instead of every 3 s while the PC
+    // sits at the logon screen (no user token is available there).
+    let mut last_error: Option<String> = None;
 
     loop {
         if shutdown.is_cancelled() {
@@ -78,20 +79,47 @@ pub async fn helper_supervisor(hub: crate::ipc::Hub, shutdown: CancellationToken
         };
 
         if needs_launch {
+            // Don't leave a stale helper (and a second tray icon) behind.
+            if let Some((_, old)) = current.take() {
+                terminate(&old);
+            }
             match launch_helper_in_session(session, ipc_port, &ipc_token) {
                 Ok(h) => {
                     tracing::info!("launched helper in session {session}");
                     current = Some((session, h));
+                    last_error = None;
                 }
-                Err(e) => tracing::warn!("could not launch helper in session {session}: {e:#}"),
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    if last_error.as_deref() != Some(msg.as_str()) {
+                        tracing::warn!("could not launch helper in session {session}: {msg}");
+                        last_error = Some(msg);
+                    }
+                }
             }
         } else if !have_user {
-            current = None;
+            if let Some((_, old)) = current.take() {
+                terminate(&old);
+            }
         }
 
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+        }
+    }
+
+    // Service is stopping (or being uninstalled/upgraded): take the helper
+    // down with it so the exe isn't locked and no orphan tray icon remains.
+    if let Some((_, h)) = current.take() {
+        terminate(&h);
+    }
+}
+
+fn terminate(h: &OwnedHandle) {
+    if process_alive(h.0) {
+        unsafe {
+            let _ = TerminateProcess(h.0, 0);
         }
     }
 }
@@ -138,11 +166,13 @@ fn launch_helper_in_session(
 
         // Command line: "<exe>" helper
         let exe = std::env::current_exe().map_err(|_| windows::core::Error::from_win32())?;
-        let mut cmdline: Vec<u16> =
-            format!("\"{}\" helper --ipc-port {ipc_port} --ipc-token {ipc_token}", exe.display())
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+        let mut cmdline: Vec<u16> = format!(
+            "\"{}\" helper --ipc-port {ipc_port} --ipc-token {ipc_token}",
+            exe.display()
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
 
         let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
         let mut si = STARTUPINFOW::default();

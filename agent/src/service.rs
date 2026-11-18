@@ -38,17 +38,29 @@ pub fn install_service() -> anyhow::Result<()> {
         account_password: None,
     };
 
-    let service = manager.create_service(
-        &info,
-        ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS,
-    )?;
+    let access = ServiceAccess::CHANGE_CONFIG | ServiceAccess::START | ServiceAccess::QUERY_STATUS;
+    // On upgrade/reinstall the service already exists: update it in place
+    // instead of failing (which used to leave it stopped after an upgrade).
+    let service = match manager.open_service(SERVICE_NAME, access) {
+        Ok(existing) => {
+            existing.change_config(&info)?;
+            existing
+        }
+        Err(_) => manager.create_service(&info, access)?,
+    };
     service.set_description(SERVICE_DESC)?;
 
     // Configure automatic restart on crash: reset count daily, restart after 5s.
     configure_recovery().ok();
 
-    // Start it right away.
-    service.start::<&str>(&[])?;
+    // Start it right away (unless it is somehow already running).
+    let running = service
+        .query_status()
+        .map(|s| s.current_state != ServiceState::Stopped)
+        .unwrap_or(false);
+    if !running {
+        service.start::<&str>(&[])?;
+    }
     Ok(())
 }
 
@@ -71,8 +83,7 @@ fn configure_recovery() -> anyhow::Result<()> {
 }
 
 pub fn uninstall_service() -> anyhow::Result<()> {
-    let manager =
-        ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     let service = manager.open_service(
         SERVICE_NAME,
         ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
@@ -94,16 +105,15 @@ pub fn run() -> anyhow::Result<()> {
     let shutdown = shutdown_token();
 
     let handler_shutdown = shutdown.clone();
-    let status_handle = service_control_handler::register(SERVICE_NAME, move |control| {
-        match control {
+    let status_handle =
+        service_control_handler::register(SERVICE_NAME, move |control| match control {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 handler_shutdown.cancel();
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
-        }
-    })?;
+        })?;
 
     let set_state = |state: ServiceState, controls: ServiceControlAccept| {
         let _ = status_handle.set_service_status(ServiceStatus {
@@ -132,7 +142,9 @@ pub fn run() -> anyhow::Result<()> {
 
 pub fn init_logging(tag: &str) {
     let _ = paths::ensure_data_dir();
-    let file_appender = tracing_appender::rolling::daily(paths::log_dir(), format!("{tag}.log"));
+    let Some(file_appender) = rolling_log(paths::log_dir(), &format!("{tag}.log")) else {
+        return;
+    };
     let _ = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_writer(file_appender)
@@ -141,7 +153,24 @@ pub fn init_logging(tag: &str) {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .try_init();
-    tracing::info!("FleetView agent {} starting ({tag})", env!("CARGO_PKG_VERSION"));
+    tracing::info!(
+        "FleetView agent {} starting ({tag})",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Daily-rolling log file that keeps only the last two weeks (the default
+/// appender keeps every file forever).
+pub fn rolling_log(
+    dir: std::path::PathBuf,
+    name: &str,
+) -> Option<tracing_appender::rolling::RollingFileAppender> {
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(name)
+        .max_log_files(14)
+        .build(dir)
+        .ok()
 }
 
 /// The real work. Supervises the user-session helper and the master connection.
@@ -149,6 +178,9 @@ pub async fn worker_main(shutdown: CancellationToken) {
     if let Err(e) = paths::ensure_data_dir() {
         tracing::error!("cannot create data dir: {e:#}");
     }
+    paths::lock_down_data_dir();
+    // Leftovers from a previous run (crash / power loss mid-install).
+    let _ = std::fs::remove_dir_all(paths::staging_dir());
     let _ = std::fs::create_dir_all(paths::staging_dir());
 
     let cfg = match crate::config::AgentConfig::load() {

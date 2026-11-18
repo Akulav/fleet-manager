@@ -45,10 +45,8 @@ impl DiscoveryBeacon {
         master_name: &str,
         issued_at_ms: i64,
     ) -> Vec<u8> {
-        format!(
-            "{protocol}|{control_port}|{cert_fingerprint}|{master_name}|{issued_at_ms}"
-        )
-        .into_bytes()
+        format!("{protocol}|{control_port}|{cert_fingerprint}|{master_name}|{issued_at_ms}")
+            .into_bytes()
     }
 
     pub fn canonical_bytes(&self) -> Vec<u8> {

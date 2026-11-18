@@ -8,7 +8,9 @@ use fleetview_shared::protocol::{DiskInfo, Telemetry};
 use sysinfo::{Disks, Networks, System};
 
 pub fn gather(logged_in_user: Option<String>) -> Telemetry {
-    let mut sys = System::new_all();
+    // Only CPU + memory are needed; `new_all()` would also enumerate every
+    // process on each report.
+    let mut sys = System::new();
     // CPU usage needs two samples spaced apart.
     sys.refresh_cpu_all();
     std::thread::sleep(Duration::from_millis(250));
@@ -40,7 +42,7 @@ pub fn gather(logged_in_user: Option<String>) -> Telemetry {
     let networks = Networks::new_with_refreshed_list();
     let mut ip_addresses = Vec::new();
     let mut mac_addresses = Vec::new();
-    for (_name, data) in networks.iter() {
+    for data in networks.values() {
         for ipnet in data.ip_networks() {
             let ip = ipnet.addr;
             if ip.is_loopback() {

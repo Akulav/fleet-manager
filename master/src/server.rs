@@ -18,7 +18,17 @@ use fleetview_shared::protocol::{AgentMsg, MasterMsg};
 use fleetview_shared::{DISCOVERY_MAGIC, DISCOVERY_PORT, PROTOCOL_VERSION};
 
 use crate::settings::MasterSettings;
-use crate::state::{save_known, AgentView, ScreenFrame, SharedState};
+use crate::state::{push_bounded, save_known, AgentView, ScreenFrame, SharedState};
+
+/// TLS handshake + Hello must complete within this.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+/// An enrolled agent that sends nothing (not even a heartbeat) for this long is
+/// considered gone.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+/// Frame size limit before enrollment (a Hello is a few hundred bytes).
+const PRE_AUTH_MAX_FRAME: usize = 64 * 1024;
+/// Per-agent console buffer cap.
+const CONSOLE_MAX_BYTES: usize = 200_000;
 
 pub fn spawn_backend(settings: MasterSettings, state: SharedState) {
     std::thread::spawn(move || {
@@ -96,7 +106,16 @@ async fn control_server(settings: Arc<MasterSettings>, state: SharedState) -> Re
         let settings = settings.clone();
         let state = state.clone();
         tokio::spawn(async move {
-            match acceptor.accept(tcp).await {
+            // Bound the unauthenticated phase so idle/slow connections can't
+            // pile up.
+            match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "handshake timed out",
+                    ))
+                }) {
                 Ok(tls) => {
                     if let Err(e) = handle_agent(tls, peer, settings, state.clone()).await {
                         if let Ok(mut s) = state.lock() {
@@ -123,15 +142,20 @@ async fn handle_agent<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
+    // Small frame limit until the agent has proven the enrollment secret, so
+    // an unauthenticated peer can't make us allocate 64 MiB buffers.
     let mut framed = Framed::new(
         tls,
         LengthDelimitedCodec::builder()
-            .max_frame_length(fleetview_shared::MAX_FRAME_BYTES)
+            .max_frame_length(PRE_AUTH_MAX_FRAME)
             .new_codec(),
     );
 
     // First message must be Hello.
-    let first = framed.next().await.context("no hello")??;
+    let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, framed.next())
+        .await
+        .context("hello timed out")?
+        .context("no hello")??;
     let hello = match rmp_serde::from_slice::<AgentMsg>(&first)? {
         AgentMsg::Hello(h) => h,
         _ => anyhow::bail!("expected hello"),
@@ -165,6 +189,9 @@ where
             reason: String::new(),
         })?)
         .await?;
+    framed
+        .codec_mut()
+        .set_max_frame_length(fleetview_shared::MAX_FRAME_BYTES);
 
     // Register the agent with a command channel.
     let agent_id = if hello.agent_id.trim().is_empty() {
@@ -200,7 +227,10 @@ where
         entry.addr = Some(peer);
         entry.last_seen = now;
         entry.tx = Some(tx.clone());
-        s.log(format!("{} ({}) connected from {peer}", hello.hostname, agent_id));
+        s.log(format!(
+            "{} ({}) connected from {peer}",
+            hello.hostname, agent_id
+        ));
         save_known(&s);
     }
 
@@ -210,17 +240,26 @@ where
 
     let result = agent_loop(&mut framed, &mut rx, &agent_id, &state).await;
 
-    // Mark offline.
+    // Mark offline — but only if this connection is still the current one.
+    // When an agent reconnects before its old (dead) connection times out, the
+    // new connection already replaced `tx`; clearing it here would show a live
+    // agent as offline and drop every command sent to it.
     {
         let mut s = state.lock().unwrap();
+        let mut went_offline = false;
         if let Some(a) = s.agents.get_mut(&agent_id) {
-            a.online = false;
-            a.streaming = false;
-            a.tx = None;
-            a.last_seen = Local::now();
+            if a.tx.as_ref().is_some_and(|cur| cur.same_channel(&tx)) {
+                a.online = false;
+                a.streaming = false;
+                a.tx = None;
+                a.last_seen = Local::now();
+                went_offline = true;
+            }
         }
-        s.log(format!("{agent_id} went offline"));
-        save_known(&s);
+        if went_offline {
+            s.log(format!("{} ({agent_id}) went offline", hello.hostname));
+            save_known(&s);
+        }
     }
 
     result
@@ -243,7 +282,13 @@ where
                     None => break,
                 }
             }
-            incoming = framed.next() => {
+            // Agents heartbeat every 20 s. A PC that lost power or network never
+            // closes its TCP connection, so without this it would stay
+            // "online" forever.
+            incoming = tokio::time::timeout(IDLE_TIMEOUT, framed.next()) => {
+                let incoming = incoming.map_err(|_| {
+                    anyhow::anyhow!("no traffic for {} s", IDLE_TIMEOUT.as_secs())
+                })?;
                 let Some(frame) = incoming else { break };
                 let frame = frame?;
                 let msg: AgentMsg = rmp_serde::from_slice(&frame)?;
@@ -257,7 +302,9 @@ where
 fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
     let mut s = state.lock().unwrap();
     let now = Local::now();
-    let Some(a) = s.agents.get_mut(agent_id) else { return };
+    let Some(a) = s.agents.get_mut(agent_id) else {
+        return;
+    };
     a.last_seen = now;
     match msg {
         AgentMsg::Hello(_) => {}
@@ -273,27 +320,33 @@ fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
                 "\n$ [{}] exit={:?} ok={}\n",
                 r.command_id, r.exit_code, r.success
             );
-            a.console_output.push_str(&header);
-            if !r.stdout.is_empty() {
-                a.console_output.push_str(&r.stdout);
-            }
+            let mut text = header;
+            text.push_str(&r.stdout);
             if !r.stderr.is_empty() {
-                a.console_output.push_str("\n[stderr]\n");
-                a.console_output.push_str(&r.stderr);
+                text.push_str("\n[stderr]\n");
+                text.push_str(&r.stderr);
             }
-            // Keep the buffer bounded.
-            if a.console_output.len() > 200_000 {
-                let cut = a.console_output.len() - 200_000;
-                a.console_output = a.console_output.split_off(cut);
-            }
+            push_bounded(&mut a.console_output, &text, CONSOLE_MAX_BYTES);
         }
-        AgentMsg::ScreenFrame { width, height, jpeg, .. } => {
-            a.last_frame = Some(ScreenFrame { width, height, jpeg });
+        AgentMsg::ScreenFrame {
+            width,
+            height,
+            jpeg,
+            ..
+        } => {
+            a.last_frame = Some(ScreenFrame {
+                width,
+                height,
+                jpeg,
+            });
             a.frame_seq = a.frame_seq.wrapping_add(1);
         }
-        AgentMsg::FileAck { transfer_id, received } => {
-            let host = a.hostname.clone();
-            s.log(format!("{host}: transfer {transfer_id} {received} bytes"));
+        // One ack per 256 KiB chunk — far too many for the event list.
+        AgentMsg::FileAck {
+            transfer_id,
+            received,
+        } => {
+            tracing::debug!("{}: transfer {transfer_id} {received} bytes", a.hostname);
         }
         AgentMsg::Heartbeat => {}
         AgentMsg::Log { level, message } => {

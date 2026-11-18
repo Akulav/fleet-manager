@@ -37,6 +37,9 @@ pub struct App {
     url_input: String,
     stream_fps: u32,
 
+    // "Run on ALL" awaiting confirmation: (script, target agent ids)
+    pending_run_all: Option<(String, Vec<String>)>,
+
     // agent-config export window
     show_config: bool,
     config_text: String,
@@ -44,7 +47,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>, state: SharedState, settings: MasterSettings) -> Self {
+    pub fn new(
+        _cc: &eframe::CreationContext<'_>,
+        state: SharedState,
+        settings: MasterSettings,
+    ) -> Self {
         Self {
             state,
             settings,
@@ -60,14 +67,19 @@ impl App {
             install_is_msi: false,
             url_input: String::new(),
             stream_fps: 2,
+            pending_run_all: None,
             show_config: false,
             config_text: String::new(),
             config_master_addr: String::new(),
         }
     }
 
+    /// Unique id per command. A bare millisecond timestamp collided when one
+    /// click sent several messages (e.g. "Run on ALL", or a file push).
     fn new_command_id() -> String {
-        format!("{}", chrono::Local::now().timestamp_millis())
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{}-{n}", chrono::Local::now().timestamp_millis())
     }
 }
 
@@ -81,6 +93,9 @@ impl eframe::App for App {
         self.central(ctx);
         if self.show_config {
             self.config_window(ctx);
+        }
+        if self.pending_run_all.is_some() {
+            self.confirm_run_all_window(ctx);
         }
     }
 }
@@ -102,7 +117,7 @@ impl App {
                         s.master_name.clone(),
                     )
                 };
-                ui.label(format!("{name}"));
+                ui.label(name.to_string());
                 ui.separator();
                 if listening {
                     ui.colored_label(egui::Color32::from_rgb(40, 180, 120), "● listening");
@@ -148,7 +163,8 @@ impl App {
                         s.agents
                             .values()
                             .map(|a| {
-                                let cpu = a.telemetry.as_ref().map(|t| t.cpu_usage_pct).unwrap_or(0.0);
+                                let cpu =
+                                    a.telemetry.as_ref().map(|t| t.cpu_usage_pct).unwrap_or(0.0);
                                 (a.agent_id.clone(), a.hostname.clone(), a.online, cpu)
                             })
                             .collect()
@@ -233,11 +249,13 @@ impl App {
             ui.collapsing("Events", |ui| {
                 let events: Vec<String> =
                     self.state.lock().unwrap().events.iter().cloned().collect();
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    for e in events {
-                        ui.monospace(e);
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for e in events {
+                            ui.monospace(e);
+                        }
+                    });
             });
         });
     }
@@ -293,48 +311,59 @@ impl App {
             ui.label("No telemetry yet…");
             return;
         };
-        egui::Grid::new("tele").num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
-            ui.strong("OS");
-            ui.label(&t.os_version);
-            ui.end_row();
-            ui.strong("Logged-in user");
-            ui.label(t.logged_in_user.clone().unwrap_or_else(|| "—".into()));
-            ui.end_row();
-            ui.strong("CPU");
-            ui.label(format!("{} ({} cores) — {:.0}%", t.cpu_name, t.cpu_cores, t.cpu_usage_pct));
-            ui.end_row();
-            ui.strong("Memory");
-            ui.label(format!(
-                "{} / {} MB ({:.0}%)",
-                t.mem_used_mb,
-                t.mem_total_mb,
-                100.0 * t.mem_used_mb as f32 / t.mem_total_mb.max(1) as f32
-            ));
-            ui.end_row();
-            ui.strong("Uptime");
-            ui.label(format!("{} h", t.uptime_secs / 3600));
-            ui.end_row();
-            ui.strong("IP addresses");
-            ui.label(t.ip_addresses.join(", "));
-            ui.end_row();
-            ui.strong("MAC addresses");
-            ui.label(t.mac_addresses.join(", "));
-            ui.end_row();
-            ui.strong("Agent version");
-            ui.label(&t.agent_version);
-            ui.end_row();
-        });
+        egui::Grid::new("tele")
+            .num_columns(2)
+            .spacing([14.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("OS");
+                ui.label(&t.os_version);
+                ui.end_row();
+                ui.strong("Logged-in user");
+                ui.label(t.logged_in_user.clone().unwrap_or_else(|| "—".into()));
+                ui.end_row();
+                ui.strong("CPU");
+                ui.label(format!(
+                    "{} ({} cores) — {:.0}%",
+                    t.cpu_name, t.cpu_cores, t.cpu_usage_pct
+                ));
+                ui.end_row();
+                ui.strong("Memory");
+                ui.label(format!(
+                    "{} / {} MB ({:.0}%)",
+                    t.mem_used_mb,
+                    t.mem_total_mb,
+                    100.0 * t.mem_used_mb as f32 / t.mem_total_mb.max(1) as f32
+                ));
+                ui.end_row();
+                ui.strong("Uptime");
+                ui.label(format!("{} h", t.uptime_secs / 3600));
+                ui.end_row();
+                ui.strong("IP addresses");
+                ui.label(t.ip_addresses.join(", "));
+                ui.end_row();
+                ui.strong("MAC addresses");
+                ui.label(t.mac_addresses.join(", "));
+                ui.end_row();
+                ui.strong("Agent version");
+                ui.label(&t.agent_version);
+                ui.end_row();
+            });
         ui.add_space(10.0);
         ui.strong("Disks");
         for d in &t.disks {
             let used = d.total_gb - d.available_gb;
-            let frac = if d.total_gb > 0.0 { (used / d.total_gb) as f32 } else { 0.0 };
+            let frac = if d.total_gb > 0.0 {
+                (used / d.total_gb) as f32
+            } else {
+                0.0
+            };
             ui.horizontal(|ui| {
-                ui.label(format!("{}", d.mount));
-                ui.add(egui::ProgressBar::new(frac).desired_width(220.0).text(format!(
-                    "{:.0}/{:.0} GB",
-                    used, d.total_gb
-                )));
+                ui.label(d.mount.to_string());
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(220.0)
+                        .text(format!("{:.0}/{:.0} GB", used, d.total_gb)),
+                );
             });
         }
 
@@ -376,7 +405,14 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Install from URL:");
             ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(260.0));
-            if ui.button("Download & run").clicked() && !self.url_input.is_empty() {
+            let url_ok = self.url_input.trim().to_lowercase().starts_with("https://");
+            if !self.url_input.trim().is_empty() && !url_ok {
+                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), "https:// only");
+            }
+            if ui
+                .add_enabled(url_ok, egui::Button::new("Download & run"))
+                .clicked()
+            {
                 let run = RunSpec {
                     command_id: Self::new_command_id(),
                     args: split_args(&self.install_args),
@@ -386,7 +422,7 @@ impl App {
                     id,
                     MasterMsg::InstallFromUrl {
                         command_id: run.command_id.clone(),
-                        url: self.url_input.clone(),
+                        url: self.url_input.trim().to_string(),
                         run,
                     },
                 );
@@ -421,9 +457,11 @@ impl App {
 
         ui.label(format!("{} program(s)", list.len()));
         egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("sw").striped(true).num_columns(3).spacing([12.0, 4.0]).show(
-                ui,
-                |ui| {
+            egui::Grid::new("sw")
+                .striped(true)
+                .num_columns(3)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
                     ui.strong("Name");
                     ui.strong("Version");
                     ui.strong("");
@@ -447,8 +485,7 @@ impl App {
                         }
                         ui.end_row();
                     }
-                },
-            );
+                });
         });
     }
 
@@ -465,19 +502,17 @@ impl App {
             if ui.button("▶ Run").clicked() && !self.ps_input.trim().is_empty() {
                 let script = self.ps_input.clone();
                 if self.ps_run_all {
+                    // Running SYSTEM-level code on the whole fleet is never a
+                    // single click: ask first (see `confirm_run_all_window`).
                     let ids: Vec<String> = {
                         let s = self.state.lock().unwrap();
-                        s.agents.values().filter(|a| a.online).map(|a| a.agent_id.clone()).collect()
+                        s.agents
+                            .values()
+                            .filter(|a| a.online)
+                            .map(|a| a.agent_id.clone())
+                            .collect()
                     };
-                    for aid in ids {
-                        self.send_to(
-                            &aid,
-                            MasterMsg::RunPowerShell {
-                                command_id: Self::new_command_id(),
-                                script: script.clone(),
-                            },
-                        );
-                    }
+                    self.pending_run_all = Some((script, ids));
                 } else {
                     self.send_to(
                         id,
@@ -493,22 +528,32 @@ impl App {
         ui.separator();
         let output = {
             let s = self.state.lock().unwrap();
-            s.agents.get(id).map(|a| a.console_output.clone()).unwrap_or_default()
+            s.agents
+                .get(id)
+                .map(|a| a.console_output.clone())
+                .unwrap_or_default()
         };
-        egui::ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::multiline(&mut output.as_str())
-                    .desired_rows(16)
-                    .desired_width(f32::INFINITY)
-                    .code_editor(),
-            );
-        });
+        egui::ScrollArea::vertical()
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut output.as_str())
+                        .desired_rows(16)
+                        .desired_width(f32::INFINITY)
+                        .code_editor(),
+                );
+            });
     }
 
     fn tab_screen(&mut self, ui: &mut egui::Ui, id: &str) {
         ui.horizontal(|ui| {
             if ui.button("📷 Capture once").clicked() {
-                self.send_to(id, MasterMsg::RequestScreenshot { command_id: Self::new_command_id() });
+                self.send_to(
+                    id,
+                    MasterMsg::RequestScreenshot {
+                        command_id: Self::new_command_id(),
+                    },
+                );
             }
             let streaming = {
                 let s = self.state.lock().unwrap();
@@ -520,16 +565,13 @@ impl App {
                     let interval = (1000 / self.stream_fps.max(1)) as u64;
                     self.send_to(
                         id,
-                        MasterMsg::StartScreenStream { interval_ms: interval, jpeg_quality: 60 },
-                    );
-                    // Transparency: tell the user their screen is being viewed.
-                    self.send_to(
-                        id,
-                        MasterMsg::NotifyUser {
-                            title: "Remote support".into(),
-                            body: "An administrator has started viewing this screen.".into(),
+                        MasterMsg::StartScreenStream {
+                            interval_ms: interval,
+                            jpeg_quality: 60,
                         },
                     );
+                    // The agent itself notifies the user (localized) when a
+                    // live view starts or a screenshot is taken.
                     if let Ok(mut s) = self.state.lock() {
                         if let Some(a) = s.agents.get_mut(id) {
                             a.streaming = true;
@@ -551,17 +593,26 @@ impl App {
         let frame = {
             let s = self.state.lock().unwrap();
             s.agents.get(id).and_then(|a| {
-                a.last_frame.as_ref().map(|f| (a.frame_seq, f.width, f.height, f.jpeg.clone()))
+                a.last_frame
+                    .as_ref()
+                    .map(|f| (a.frame_seq, f.width, f.height, f.jpeg.clone()))
             })
         };
 
-        if let Some((seq, w, h, jpeg)) = frame {
-            let need_update = self.textures.get(id).map(|(s, _)| *s != seq).unwrap_or(true);
+        if let Some((seq, _, _, jpeg)) = frame {
+            let need_update = self
+                .textures
+                .get(id)
+                .map(|(s, _)| *s != seq)
+                .unwrap_or(true);
             if need_update {
                 if let Ok(img) = image::load_from_memory(&jpeg) {
                     let rgba = img.to_rgba8();
+                    // Use the decoded size, not the agent-reported one: a
+                    // mismatch makes `from_rgba_unmultiplied` panic, which
+                    // aborts the whole master (panic = "abort" in release).
                     let color = egui::ColorImage::from_rgba_unmultiplied(
-                        [w as usize, h as usize],
+                        [rgba.width() as usize, rgba.height() as usize],
                         rgba.as_raw(),
                     );
                     let tex = ui.ctx().load_texture(
@@ -573,9 +624,10 @@ impl App {
                 }
             }
             if let Some((_, tex)) = self.textures.get(id) {
-                let avail = ui.available_width().min(w as f32);
-                let scale = avail / w as f32;
-                let size = egui::vec2(w as f32 * scale, h as f32 * scale);
+                let [w, h] = tex.size().map(|v| v.max(1) as f32);
+                let avail = ui.available_width().min(w);
+                let scale = avail / w;
+                let size = egui::vec2(w * scale, h * scale);
                 ui.image(egui::load::SizedTexture::new(tex.id(), size));
             }
         } else {
@@ -584,7 +636,9 @@ impl App {
     }
 
     fn push_installer(&mut self, id: &str) {
-        let Some(path) = rfd::FileDialog::new().pick_file() else { return };
+        let Some(path) = rfd::FileDialog::new().pick_file() else {
+            return;
+        };
         let file_name = path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -631,6 +685,65 @@ impl App {
         });
     }
 
+    fn confirm_run_all_window(&mut self, ctx: &egui::Context) {
+        let Some((script, ids)) = self.pending_run_all.clone() else {
+            return;
+        };
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Run on ALL online agents?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This runs the script below as SYSTEM on {} online PC(s).",
+                    ids.len()
+                ));
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut script.as_str())
+                                .desired_width(420.0)
+                                .code_editor(),
+                        );
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let run = ui.add_enabled(
+                        !ids.is_empty(),
+                        egui::Button::new(format!("Run on {} PC(s)", ids.len())),
+                    );
+                    if run.clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                for aid in &ids {
+                    self.send_to(
+                        aid,
+                        MasterMsg::RunPowerShell {
+                            command_id: Self::new_command_id(),
+                            script: script.clone(),
+                        },
+                    );
+                }
+                if let Ok(mut s) = self.state.lock() {
+                    s.log(format!("PowerShell sent to {} agent(s)", ids.len()));
+                }
+                self.pending_run_all = None;
+            }
+            Some(false) => self.pending_run_all = None,
+            None => {}
+        }
+    }
+
     fn config_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_config;
         egui::Window::new("Agent installer configuration")
@@ -657,13 +770,15 @@ impl App {
                     }
                 });
                 ui.separator();
-                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.config_text.as_str())
-                            .desired_width(f32::INFINITY)
-                            .code_editor(),
-                    );
-                });
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.config_text.as_str())
+                                .desired_width(f32::INFINITY)
+                                .code_editor(),
+                        );
+                    });
                 ui.horizontal(|ui| {
                     if ui.button("Copy to clipboard").clicked() {
                         ui.ctx().copy_text(self.config_text.clone());
@@ -693,19 +808,106 @@ fn split_args(s: &str) -> Vec<String> {
     s.split_whitespace().map(|x| x.to_string()).collect()
 }
 
-/// Best-effort silent uninstall from an uninstall string.
+/// Quote a value as a PowerShell single-quoted string literal.
+fn ps_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Split an UninstallString into (executable, remaining arguments).
+fn split_command(cmd: &str) -> (String, String) {
+    let cmd = cmd.trim();
+    if let Some(rest) = cmd.strip_prefix('"') {
+        if let Some(end) = rest.find('"') {
+            return (rest[..end].to_string(), rest[end + 1..].trim().to_string());
+        }
+        return (rest.to_string(), String::new());
+    }
+    // Unquoted: the path may contain spaces, so cut after ".exe" if present.
+    let lower = cmd.to_lowercase();
+    if let Some(i) = lower.find(".exe") {
+        let end = i + 4;
+        return (cmd[..end].to_string(), cmd[end..].trim().to_string());
+    }
+    match cmd.split_once(' ') {
+        Some((exe, args)) => (exe.to_string(), args.trim().to_string()),
+        None => (cmd.to_string(), String::new()),
+    }
+}
+
+/// Best-effort silent uninstall from an uninstall string. The generated
+/// script waits for the uninstaller and exits with its exit code, so the
+/// console shows real success/failure.
 fn uninstall_script(uninstall: &str) -> String {
-    let lower = uninstall.to_lowercase();
-    if lower.contains("msiexec") {
-        // Convert an install string to a quiet uninstall.
-        let s = uninstall.replace("/I", "/X").replace("/i", "/X");
-        if s.to_lowercase().contains("/qn") {
-            format!("cmd /c {s}")
-        } else {
-            format!("cmd /c {s} /qn /norestart")
+    let (exe, mut args) = split_command(uninstall);
+    let exe_name = std::path::Path::new(&exe)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let (file, args) = if exe_name.starts_with("msiexec") {
+        // Use the product code if there is one; otherwise just switch /I → /X.
+        match (uninstall.find('{'), uninstall.find('}')) {
+            (Some(a), Some(b)) if b > a => (
+                "msiexec.exe".to_string(),
+                format!("/X {} /qn /norestart", &uninstall[a..=b]),
+            ),
+            _ => {
+                let mut a = args.replacen("/I", "/X", 1).replacen("/i", "/X", 1);
+                if !a.to_lowercase().contains("/q") {
+                    a.push_str(" /qn /norestart");
+                }
+                ("msiexec.exe".to_string(), a)
+            }
         }
     } else {
-        // Try passing common silent switches; may still show UI for some apps.
-        format!("Start-Process -Wait -FilePath cmd -ArgumentList '/c',@'\n{uninstall} /S\n'@")
+        let lower = args.to_lowercase();
+        if exe_name.starts_with("unins") {
+            // Inno Setup uninstaller.
+            if !lower.contains("/verysilent") {
+                args.push_str(" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART");
+            }
+        } else if !lower.contains("/s") && !lower.contains("/quiet") {
+            // NSIS and many others; may still show UI for some apps.
+            args.push_str(" /S");
+        }
+        (exe, args.trim().to_string())
+    };
+
+    let arg_list = if args.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" -ArgumentList {}", ps_quote(args.trim()))
+    };
+    format!(
+        "$p = Start-Process -FilePath {}{arg_list} -Wait -PassThru -WindowStyle Hidden\n\
+         exit $p.ExitCode",
+        ps_quote(&file)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn msi_uses_product_code() {
+        let s = uninstall_script("MsiExec.exe /I{12345678-ABCD-1234-ABCD-1234567890AB}");
+        assert!(s.contains("'msiexec.exe'"));
+        assert!(s.contains("/X {12345678-ABCD-1234-ABCD-1234567890AB} /qn /norestart"));
+        assert!(s.contains("exit $p.ExitCode"));
+    }
+
+    #[test]
+    fn inno_gets_verysilent_and_quotes_are_escaped() {
+        let s = uninstall_script(r#""C:\Program Files\O'Brien App\unins000.exe""#);
+        assert!(s.contains(r"'C:\Program Files\O''Brien App\unins000.exe'"));
+        assert!(s.contains("/VERYSILENT"));
+    }
+
+    #[test]
+    fn unquoted_path_with_spaces() {
+        let (exe, args) = split_command(r"C:\Program Files\App\uninstall.exe /x y");
+        assert_eq!(exe, r"C:\Program Files\App\uninstall.exe");
+        assert_eq!(args, "/x y");
     }
 }

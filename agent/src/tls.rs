@@ -6,11 +6,16 @@
 //! band — the master's cert fingerprint is baked into the agent config at
 //! install time. This both avoids PKI setup on a closed LAN and prevents a
 //! rogue host from impersonating the master after an IP change.
+//!
+//! IMPORTANT: pinning the certificate alone is not enough. The certificate is
+//! public (the master sends it in every handshake), so anyone could replay it.
+//! What proves possession of the matching private key is the handshake
+//! signature, which we therefore verify with the crypto provider below.
 
 use std::sync::Arc;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::ring as provider;
+use rustls::crypto::{ring as provider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 
@@ -18,6 +23,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 struct PinnedCertVerifier {
     /// Lowercase hex SHA-256 of the pinned certificate DER.
     fingerprint: String,
+    algs: WebPkiSupportedAlgorithms,
 }
 
 impl ServerCertVerifier for PinnedCertVerifier {
@@ -40,38 +46,39 @@ impl ServerCertVerifier for PinnedCertVerifier {
         }
     }
 
-    // Once the leaf certificate is pinned, the handshake signature is produced
-    // by that very certificate's key, so we accept it.
+    // The handshake signature MUST be verified against the (pinned) leaf
+    // certificate's public key; otherwise a host that merely replays the
+    // public certificate would be accepted as the master.
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        provider::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
+        self.algs.supported_schemes()
     }
 }
 
 pub fn client_config(cert_fingerprint: &str) -> Arc<ClientConfig> {
+    let provider = Arc::new(provider::default_provider());
     let verifier = Arc::new(PinnedCertVerifier {
-        fingerprint: cert_fingerprint.to_lowercase(),
+        fingerprint: cert_fingerprint.trim().to_lowercase(),
+        algs: provider.signature_verification_algorithms,
     });
-    let config = ClientConfig::builder_with_provider(Arc::new(provider::default_provider()))
+    let config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .expect("default protocol versions")
         .dangerous()

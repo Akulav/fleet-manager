@@ -66,14 +66,20 @@ pub struct Hello {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MasterMsg {
     /// Accept/deny after receiving [`Hello`].
-    HelloAck { accepted: bool, reason: String },
+    HelloAck {
+        accepted: bool,
+        reason: String,
+    },
     /// Ask for a fresh telemetry snapshot now.
     RequestTelemetry,
     /// Ask for the installed-software inventory.
     RequestSoftware,
     /// Run a PowerShell script (as LocalSystem). `elevated` is advisory; the
     /// service already runs elevated.
-    RunPowerShell { command_id: String, script: String },
+    RunPowerShell {
+        command_id: String,
+        script: String,
+    },
     /// Begin a file push (installer, script, ...). Followed by `FileChunk`s and
     /// a `FileEnd`.
     FileBegin {
@@ -98,12 +104,20 @@ pub enum MasterMsg {
         run: RunSpec,
     },
     /// One-off screenshot of the active session's primary display.
-    RequestScreenshot { command_id: String },
+    RequestScreenshot {
+        command_id: String,
+    },
     /// Start/stop a periodic screenshot stream (live view).
-    StartScreenStream { interval_ms: u64, jpeg_quality: u8 },
+    StartScreenStream {
+        interval_ms: u64,
+        jpeg_quality: u8,
+    },
     StopScreenStream,
     /// Show a toast/notification to the logged-in user (transparency feature).
-    NotifyUser { title: String, body: String },
+    NotifyUser {
+        title: String,
+        body: String,
+    },
     /// Request the agent to re-run discovery (e.g. master moved).
     Ping,
 }
@@ -134,10 +148,15 @@ pub enum AgentMsg {
         jpeg: Vec<u8>,
     },
     /// Progress/acknowledgement of a file transfer.
-    FileAck { transfer_id: String, received: u64 },
+    FileAck {
+        transfer_id: String,
+        received: u64,
+    },
     /// Keep-alive.
     Heartbeat,
     /// Free-form log line surfaced in the master's event view.
-    Log { level: String, message: String },
+    Log {
+        level: String,
+        message: String,
+    },
 }
-

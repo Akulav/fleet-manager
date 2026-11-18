@@ -38,12 +38,20 @@ fn image() -> &'static SplashImage {
                 let (w, h) = (rgba.width() as i32, rgba.height() as i32);
                 let mut bgra = rgba.into_raw();
                 // RGBA -> BGRA in place.
-                for px in bgra.chunks_exact_mut(4) {
+                for px in bgra.as_chunks_mut::<4>().0 {
                     px.swap(0, 2);
                 }
-                SplashImage { width: w, height: h, bgra }
+                SplashImage {
+                    width: w,
+                    height: h,
+                    bgra,
+                }
             }
-            Err(_) => SplashImage { width: 480, height: 240, bgra: vec![32u8; 480 * 240 * 4] },
+            Err(_) => SplashImage {
+                width: 480,
+                height: 240,
+                bgra: vec![32u8; 480 * 240 * 4],
+            },
         }
     })
 }

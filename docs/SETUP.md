@@ -93,7 +93,7 @@ seconds.
   silent; some apps still show UI in session 0).
 - **PowerShell** — *PowerShell* tab, optionally *Run on ALL online agents*.
 - **Screen** — *Screen* tab → *Capture once* or *Start live view*. The user is
-  notified when live view begins.
+  notified for every screenshot and when live view begins.
 
 ### Silent-install switches (cheat sheet)
 

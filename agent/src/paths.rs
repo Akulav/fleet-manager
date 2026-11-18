@@ -21,6 +21,40 @@ pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
     Ok(d)
 }
 
+/// Remove inherited ACEs from the data directory and grant only SYSTEM and
+/// Administrators. `%ProgramData%` lets ordinary users read files and create
+/// files/folders in subdirectories by default, which would expose the
+/// enrollment secret and let a user tamper with staged installers that the
+/// service then runs as SYSTEM. The installer does this too; repeating it at
+/// service start makes it robust against manual installs and ACL drift.
+pub fn lock_down_data_dir() {
+    let dir = data_dir();
+    let result = std::process::Command::new("icacls.exe")
+        .arg(&dir)
+        .args([
+            "/inheritance:r",
+            "/grant:r",
+            "*S-1-5-18:(OI)(CI)F",     // NT AUTHORITY\SYSTEM
+            "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administrators
+            "/T",
+            "/C",
+            "/Q",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match result {
+        Ok(st) if st.success() => {}
+        Ok(st) => tracing::warn!("icacls on {} exited with {st}", dir.display()),
+        Err(e) => tracing::warn!("cannot run icacls on {}: {e}", dir.display()),
+    }
+}
+
+/// Stable per-machine agent id (kept separate from the installer-provided config).
+pub fn agent_id_path() -> PathBuf {
+    data_dir().join("agent.id")
+}
+
 pub fn config_path() -> PathBuf {
     data_dir().join("agent.config.json")
 }

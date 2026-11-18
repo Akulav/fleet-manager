@@ -10,7 +10,11 @@ fn identity_sign_and_verify() {
     let msg = b"hello fleet";
     let sig = id.sign(msg).unwrap();
     assert!(fleetview_shared::crypto::verify_signature(&pk, msg, &sig));
-    assert!(!fleetview_shared::crypto::verify_signature(&pk, b"tampered", &sig));
+    assert!(!fleetview_shared::crypto::verify_signature(
+        &pk,
+        b"tampered",
+        &sig
+    ));
 }
 
 #[test]

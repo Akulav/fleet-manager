@@ -50,18 +50,28 @@ impl AgentConfig {
             .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", path.display()))?;
         let mut cfg: AgentConfig = serde_json::from_str(&text)?;
         if cfg.agent_id.trim().is_empty() {
-            cfg.agent_id = new_agent_id();
-            let _ = cfg.save();
+            // The installer overwrites agent.config.json on every (re)install
+            // with an empty agent_id. Keep the id in its own file so an upgrade
+            // doesn't make the PC show up as a brand-new agent on the master.
+            cfg.agent_id = load_or_create_agent_id();
         }
         Ok(cfg)
     }
+}
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        paths::ensure_data_dir()?;
-        let text = serde_json::to_string_pretty(self)?;
-        std::fs::write(paths::config_path(), text)?;
-        Ok(())
+fn load_or_create_agent_id() -> String {
+    let path = paths::agent_id_path();
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim();
+        if !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return id.to_string();
+        }
     }
+    let id = new_agent_id();
+    if let Err(e) = paths::ensure_data_dir().and_then(|_| std::fs::write(&path, &id)) {
+        tracing::warn!("cannot persist agent id to {}: {e}", path.display());
+    }
+    id
 }
 
 fn new_agent_id() -> String {

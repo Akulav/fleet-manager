@@ -36,8 +36,12 @@ change.
 ### The channel is pinned, not CA-trusted
 
 The agent's TLS verifier ignores the public CA store and instead requires the
-server certificate's SHA-256 to equal the **pinned** fingerprint. This both
-removes the need for PKI on a closed LAN and blocks man-in-the-middle hosts.
+server certificate's SHA-256 to equal the **pinned** fingerprint (always the one
+from the agent's own config, never one taken from the network). It also
+**verifies the TLS handshake signature** against that certificate's key: the
+certificate itself is public, so only the signature proves the peer holds the
+master's private key. This both removes the need for PKI on a closed LAN and
+blocks man-in-the-middle hosts.
 
 ### Agents must prove enrollment
 
@@ -48,9 +52,13 @@ rejects anything else. So joining the fleet requires possessing the secret.
 
 - **Keep `agent.config.json` and the master settings private.** Anyone with the
   enrollment secret can enroll an agent and receive commands as that master.
-- The agent config lives in `C:\ProgramData\FleetView`, which the installer
-  restricts to **SYSTEM + Administrators**. The IPC token for the service↔helper
-  channel is passed to the helper on its command line, not stored world-readable.
+- The agent config lives in `C:\ProgramData\FleetView`. `ProgramData` normally
+  lets every user read files and create files in subfolders, so both the
+  installer and the service (at every start) run `icacls … /inheritance:r` to
+  restrict the folder to **SYSTEM + Administrators** only. Staged installers are
+  written to fresh, randomly named folders inside it and deleted after running.
+- The IPC token for the service↔helper channel is passed to the helper on its
+  command line only (it is no longer written to `status.json`).
 - The master's identity key and TLS private key live in `%APPDATA%\FleetView` on
   the master host. Back them up; losing them means re-provisioning all agents.
 
@@ -60,7 +68,12 @@ FleetView is **not** covert surveillance software and should not be deployed as
 such:
 
 - the agent shows a **tray icon** whenever it runs and a **splash at logon**;
-- starting a **live screen view** notifies the user;
+- starting a **live screen view** and taking a **screenshot** both show a notice
+  to the user; this is enforced by the agent itself, not by the master, and the
+  tray tooltip says when the screen is being viewed. The stream stops
+  automatically if the master disconnects;
+- **install from URL** accepts only `https://` URLs (the file runs as SYSTEM);
+- **Run on ALL online agents** asks for confirmation with the target count;
 - every remote command (PowerShell, install, file run) is appended to a local
   **audit log** at `C:\ProgramData\FleetView\audit.log` on the agent;
 - the service name, publisher and description are plainly labelled.
@@ -76,9 +89,22 @@ get sign-off from IT security before deployment.
   with approval.
 - **Session-0 command execution** runs as SYSTEM — scripts and installers you push
   have full control of the machine. Review what you push.
-- The pinned-cert verifier accepts the handshake signature once the leaf cert
-  matches; this is standard for certificate pinning but means the cert is the sole
-  trust factor — protect the master's key material accordingly.
+- **One shared enrollment secret** for the whole fleet. Anyone holding it (e.g.
+  from a leaked `agent.config.json`) can enroll a fake agent, and can claim an
+  existing agent's id to receive the commands meant for that PC. Don't put
+  credentials in pushed scripts; rotate the master identity if the config leaks.
+- **Beacon replay.** A signed discovery beacon isn't bound to the sender's IP,
+  so a LAN host can replay one and point agents at itself. It can't finish the
+  TLS handshake, so the effect is a delayed connection (DoS), not takeover. Use
+  a fixed `master_address` if this matters.
+- **No master-side operator auth.** Anyone who can use the master PC's Windows
+  session controls the fleet. Lock the session; `%APPDATA%\FleetView` holds the
+  private keys in plain JSON (user-only ACL by default).
+- **Inventory** is read by the SYSTEM service, so per-user installs (HKCU of the
+  logged-in user) are not listed.
+- The master's periodic beacon broadcast to UDP 48621 is not received by agents
+  (they listen on an ephemeral port for replies to their own query); discovery
+  relies on the query/reply path.
 - Consider network segmentation so the master's control port (48620/TCP) is only
   reachable from managed subnets.
 

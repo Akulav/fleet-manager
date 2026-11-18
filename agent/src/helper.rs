@@ -27,9 +27,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 enum UiMsg {
-    Notify { title: String, body: String },
-    ShowSplash,
-    Status { connected: bool, master: String },
+    Notify {
+        title: String,
+        body: String,
+    },
+    Status {
+        connected: bool,
+        master: String,
+    },
+    /// Live screen view started/stopped — reflected in the tray tooltip.
+    Viewing(bool),
 }
 
 pub fn run() {
@@ -42,7 +49,10 @@ pub fn run() {
     if port != 0 && !token.is_empty() {
         let ui_tx2 = ui_tx.clone();
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     tracing::error!("helper runtime: {e}");
@@ -54,7 +64,7 @@ pub fn run() {
     }
 
     // Show the splash right away on logon.
-    std::thread::spawn(|| crate::splash::show_blocking());
+    std::thread::spawn(crate::splash::show_blocking);
 
     tray_loop(ui_rx);
 }
@@ -89,7 +99,9 @@ fn init_logging() {
     if let Some(dir) = dirs_local_app() {
         let logdir = dir.join("FleetView");
         let _ = std::fs::create_dir_all(&logdir);
-        let appender = tracing_appender::rolling::daily(logdir, "helper.log");
+        let Some(appender) = crate::service::rolling_log(logdir, "helper.log") else {
+            return;
+        };
         let _ = tracing_subscriber::fmt()
             .with_ansi(false)
             .with_writer(appender)
@@ -106,20 +118,36 @@ fn dirs_local_app() -> Option<std::path::PathBuf> {
 // ---------------------------------------------------------------------------
 
 async fn ipc_client(port: u16, token: String, ui_tx: mpsc::Sender<UiMsg>) {
+    // The port and token are only valid for the service instance that launched
+    // us. If the service restarts (crash, upgrade) it launches a fresh helper,
+    // so once we can't reach ours for a while we exit instead of lingering as
+    // an orphan with a second tray icon.
+    const MAX_FAILED_ATTEMPTS: u32 = 10;
+    let mut failures = 0u32;
     loop {
         match ipc_session(port, &token, &ui_tx).await {
-            Ok(()) => tracing::info!("ipc session closed; reconnecting"),
-            Err(e) => tracing::warn!("ipc session error: {e:#}"),
+            Ok(true) => {
+                tracing::info!("ipc session closed; reconnecting");
+                failures = 0;
+            }
+            Ok(false) => failures += 1,
+            Err(e) => {
+                tracing::warn!("ipc session error: {e:#}");
+                failures += 1;
+            }
+        }
+        let _ = ui_tx.send(UiMsg::Viewing(false));
+        if failures >= MAX_FAILED_ATTEMPTS {
+            tracing::info!("service unreachable; helper exiting");
+            std::process::exit(0);
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
-async fn ipc_session(
-    port: u16,
-    token: &str,
-    ui_tx: &mpsc::Sender<UiMsg>,
-) -> anyhow::Result<()> {
+/// Returns `Ok(true)` if the service accepted us (sent at least one command)
+/// before the session closed, `Ok(false)` if it closed straight away.
+async fn ipc_session(port: u16, token: &str, ui_tx: &mpsc::Sender<UiMsg>) -> anyhow::Result<bool> {
     let stream = TcpStream::connect(("127.0.0.1", port)).await?;
     stream.set_nodelay(true).ok();
     let mut framed = Framed::new(
@@ -130,15 +158,23 @@ async fn ipc_session(
     );
 
     // Authenticate, then say hello with the logged-in user.
-    framed.send(bytes::Bytes::from(token.as_bytes().to_vec())).await?;
-    let hello = HelperEvent::Hello { username: current_user() };
-    framed.send(bytes::Bytes::from(rmp_serde::to_vec_named(&hello)?)).await?;
+    framed
+        .send(bytes::Bytes::from(token.as_bytes().to_vec()))
+        .await?;
+    let hello = HelperEvent::Hello {
+        username: current_user(),
+    };
+    framed
+        .send(bytes::Bytes::from(rmp_serde::to_vec_named(&hello)?))
+        .await?;
 
     // Outbound queue for screen frames produced by capture tasks.
     let (out_tx, mut out_rx) = tmpsc::channel::<HelperEvent>(16);
 
     // Current screen-stream task (if any).
     let mut stream_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut accepted = false;
+    let s = tray_i18n::strings(TRAY_LANG);
 
     loop {
         tokio::select! {
@@ -148,9 +184,16 @@ async fn ipc_session(
             incoming = framed.next() => {
                 let Some(frame) = incoming else { break };
                 let frame = frame?;
+                accepted = true;
                 let cmd: HelperCommand = rmp_serde::from_slice(&frame)?;
                 match cmd {
                     HelperCommand::CaptureOnce { command_id } => {
+                        // Transparency is enforced here, on the user's machine,
+                        // rather than trusting the master to send a notice.
+                        let _ = ui_tx.send(UiMsg::Notify {
+                            title: s.view_title.into(),
+                            body: s.screenshot_taken.into(),
+                        });
                         let out = out_tx.clone();
                         tokio::spawn(async move {
                             if let Some(ev) = capture_event(Some(command_id), 70).await {
@@ -159,7 +202,16 @@ async fn ipc_session(
                         });
                     }
                     HelperCommand::StartStream { interval_ms, jpeg_quality } => {
-                        if let Some(t) = stream_task.take() { t.abort(); }
+                        match stream_task.take() {
+                            Some(t) => t.abort(),
+                            None => {
+                                let _ = ui_tx.send(UiMsg::Notify {
+                                    title: s.view_title.into(),
+                                    body: s.live_view_started.into(),
+                                });
+                                let _ = ui_tx.send(UiMsg::Viewing(true));
+                            }
+                        }
                         let out = out_tx.clone();
                         stream_task = Some(tokio::spawn(async move {
                             let mut tick = tokio::time::interval(
@@ -173,13 +225,13 @@ async fn ipc_session(
                         }));
                     }
                     HelperCommand::StopStream => {
-                        if let Some(t) = stream_task.take() { t.abort(); }
+                        if let Some(t) = stream_task.take() {
+                            t.abort();
+                            let _ = ui_tx.send(UiMsg::Viewing(false));
+                        }
                     }
                     HelperCommand::Notify { title, body } => {
                         let _ = ui_tx.send(UiMsg::Notify { title, body });
-                    }
-                    HelperCommand::ShowSplash => {
-                        let _ = ui_tx.send(UiMsg::ShowSplash);
                     }
                     HelperCommand::Status { connected, master_name } => {
                         let _ = ui_tx.send(UiMsg::Status { connected, master: master_name });
@@ -193,7 +245,7 @@ async fn ipc_session(
     if let Some(t) = stream_task.take() {
         t.abort();
     }
-    Ok(())
+    Ok(accepted)
 }
 
 async fn capture_event(command_id: Option<String>, quality: u8) -> Option<HelperEvent> {
@@ -246,32 +298,36 @@ fn tray_loop(ui_rx: mpsc::Receiver<UiMsg>) {
     let about_id = about_item.id().clone();
     let logs_id = logs_item.id().clone();
 
-    let tray = TrayIconBuilder::new()
-        .with_tooltip(s.tooltip_searching)
-        .with_menu(Box::new(menu));
-    let tray = match load_tray_icon() {
-        Some(icon) => tray.with_icon(icon),
-        None => tray,
-    };
-    let _tray = match tray.build() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::error!("tray build failed: {e}");
-            return;
+    // Right after logon the taskbar may not exist yet and creating the tray
+    // icon fails. Retry instead of exiting: an exit makes the service relaunch
+    // us every few seconds, flashing the splash each time.
+    let icon = load_tray_icon();
+    let tray = loop {
+        let builder = TrayIconBuilder::new()
+            .with_tooltip(s.tooltip_searching)
+            .with_menu(Box::new(menu.clone()));
+        let builder = match &icon {
+            Some(icon) => builder.with_icon(icon.clone()),
+            None => builder,
+        };
+        match builder.build() {
+            Ok(t) => break t,
+            Err(e) => {
+                tracing::warn!("tray build failed (retrying): {e}");
+                pump_messages();
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
         }
     };
 
     let menu_channel = MenuEvent::receiver();
+    let mut connected = false;
+    let mut master = String::new();
+    let mut viewing = false;
 
     loop {
         // Pump Win32 messages so the tray icon works.
-        unsafe {
-            let mut msg = MSG::default();
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-        }
+        pump_messages();
 
         // Tray menu clicks.
         while let Ok(ev) = menu_channel.try_recv() {
@@ -284,26 +340,53 @@ fn tray_loop(ui_rx: mpsc::Receiver<UiMsg>) {
         }
 
         // Commands from the IPC thread.
+        let mut changed = false;
         while let Ok(msg) = ui_rx.try_recv() {
             match msg {
                 UiMsg::Notify { title, body } => show_message_box(&title, &body),
-                UiMsg::ShowSplash => {
-                    std::thread::spawn(|| crate::splash::show_blocking());
+                UiMsg::Status {
+                    connected: c,
+                    master: m,
+                } => {
+                    connected = c;
+                    master = m;
+                    changed = true;
                 }
-                UiMsg::Status { connected, master } => {
-                    let s = tray_i18n::strings(TRAY_LANG);
-                    let (tip, status) = if connected {
-                        (format!("{} {}", s.tooltip_connected, master), s.menu_status_connected)
-                    } else {
-                        (s.tooltip_searching.to_string(), s.menu_status_searching)
-                    };
-                    let _ = _tray.set_tooltip(Some(tip));
-                    status_item.set_text(status);
+                UiMsg::Viewing(v) => {
+                    viewing = v;
+                    changed = true;
                 }
             }
         }
+        if changed {
+            let s = tray_i18n::strings(TRAY_LANG);
+            let tip = if viewing {
+                s.tooltip_viewing.to_string()
+            } else if connected {
+                format!("{} {}", s.tooltip_connected, master)
+            } else {
+                s.tooltip_searching.to_string()
+            };
+            let status = if connected {
+                s.menu_status_connected
+            } else {
+                s.menu_status_searching
+            };
+            let _ = tray.set_tooltip(Some(tip));
+            status_item.set_text(status);
+        }
 
         std::thread::sleep(std::time::Duration::from_millis(80));
+    }
+}
+
+fn pump_messages() {
+    unsafe {
+        let mut msg = MSG::default();
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
 }
 
@@ -331,7 +414,9 @@ fn show_message_box(title: &str, body: &str) {
 fn open_logs_folder() {
     if let Some(dir) = dirs_local_app() {
         let logdir = dir.join("FleetView");
-        let _ = std::process::Command::new("explorer.exe").arg(logdir).spawn();
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(logdir)
+            .spawn();
     }
 }
 
