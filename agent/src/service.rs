@@ -140,6 +140,14 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fresh random per-run secret for the sign-bridge (helper ↔ e-Management).
+fn new_bridge_token() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut b);
+    hex::encode(b)
+}
+
 pub fn init_logging(tag: &str) {
     let _ = paths::ensure_data_dir();
     let Some(file_appender) = rolling_log(paths::log_dir(), &format!("{tag}.log")) else {
@@ -196,6 +204,13 @@ pub async fn worker_main(shutdown: CancellationToken) {
         }
     };
 
+    // Per-run secret for the MoldSign sign-bridge, derived settings from config.
+    let bridge = cfg.sign_bridge_settings(new_bridge_token());
+    match &bridge {
+        Some(b) => tracing::info!("sign-bridge enabled for e-Management origin {}", b.origin),
+        None => tracing::debug!("sign-bridge disabled (no emanagement_url configured)"),
+    }
+
     // Shared IPC hub between service and the user-session helper.
     let hub = crate::ipc::Hub::new();
 
@@ -214,7 +229,7 @@ pub async fn worker_main(shutdown: CancellationToken) {
     let helper_task = {
         let sd = shutdown.clone();
         let hub = hub.clone();
-        tokio::spawn(async move { crate::session::helper_supervisor(hub, sd).await })
+        tokio::spawn(async move { crate::session::helper_supervisor(hub, bridge, sd).await })
     };
 
     // Task 3: discover + connect to the master, forever (with backoff).

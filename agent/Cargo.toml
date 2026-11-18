@@ -38,6 +38,11 @@ winreg = "0.52"
 tray-icon = "0.19"
 xcap = "0.0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# Tiny blocking HTTP/1.1 server for the loopback MoldSign sign-bridge. Chosen
+# over hyper to keep the surface and the dependency tree small: the bridge needs
+# only to accept a handful of localhost requests, and tiny_http does exactly that
+# with no async machinery of its own (we drive reqwest on a private runtime).
+tiny_http = "0.12"
 
 [dependencies.windows]
 version = "0.58"

@@ -40,9 +40,17 @@ enum UiMsg {
 }
 
 pub fn run() {
-    let (port, token) = parse_args();
+    let args = parse_args();
+    let (port, token) = (args.ipc_port, args.ipc_token.clone());
     init_logging();
     tracing::info!("helper starting (ipc port {port})");
+
+    // Optional document-signing bridge (browser → helper → MoldSign). Only
+    // started when the service provisioned e-Management settings; otherwise the
+    // helper runs exactly as before.
+    if let Some(bridge) = args.sign_bridge() {
+        crate::signbridge::spawn(bridge);
+    }
 
     let (ui_tx, ui_rx) = mpsc::channel::<UiMsg>();
 
@@ -69,30 +77,83 @@ pub fn run() {
     tray_loop(ui_rx);
 }
 
-fn parse_args() -> (u16, String) {
+#[derive(Default)]
+struct HelperArgs {
+    ipc_port: u16,
+    ipc_token: String,
+    /// Sign-bridge settings (all three required to enable the bridge).
+    emgmt_origin: String,
+    emgmt_validate_url: String,
+    sign_bridge_token: String,
+    moldsign_path: Option<String>,
+}
+
+impl HelperArgs {
+    /// Build the bridge config if the service provisioned the required fields.
+    fn sign_bridge(&self) -> Option<crate::signbridge::BridgeConfig> {
+        if self.emgmt_origin.is_empty()
+            || self.emgmt_validate_url.is_empty()
+            || self.sign_bridge_token.is_empty()
+        {
+            return None;
+        }
+        Some(crate::signbridge::BridgeConfig {
+            emanagement_origin: self.emgmt_origin.clone(),
+            validate_url: self.emgmt_validate_url.clone(),
+            bridge_token: self.sign_bridge_token.clone(),
+            moldsign_exe: self.moldsign_path.clone(),
+        })
+    }
+}
+
+fn parse_args() -> HelperArgs {
     let args: Vec<String> = std::env::args().collect();
-    let mut port = 0u16;
-    let mut token = String::new();
+    let mut out = HelperArgs::default();
     let mut i = 0;
     while i < args.len() {
+        let take = |i: &mut usize| -> Option<String> {
+            let v = args.get(*i + 1).cloned();
+            if v.is_some() {
+                *i += 1;
+            }
+            v
+        };
         match args[i].as_str() {
             "--ipc-port" => {
-                if let Some(v) = args.get(i + 1) {
-                    port = v.parse().unwrap_or(0);
-                    i += 1;
+                if let Some(v) = take(&mut i) {
+                    out.ipc_port = v.parse().unwrap_or(0);
                 }
             }
             "--ipc-token" => {
-                if let Some(v) = args.get(i + 1) {
-                    token = v.clone();
-                    i += 1;
+                if let Some(v) = take(&mut i) {
+                    out.ipc_token = v;
+                }
+            }
+            "--emgmt-origin" => {
+                if let Some(v) = take(&mut i) {
+                    out.emgmt_origin = v;
+                }
+            }
+            "--emgmt-validate-url" => {
+                if let Some(v) = take(&mut i) {
+                    out.emgmt_validate_url = v;
+                }
+            }
+            "--sign-bridge-token" => {
+                if let Some(v) = take(&mut i) {
+                    out.sign_bridge_token = v;
+                }
+            }
+            "--moldsign-path" => {
+                if let Some(v) = take(&mut i) {
+                    out.moldsign_path = Some(v);
                 }
             }
             _ => {}
         }
         i += 1;
     }
-    (port, token)
+    out
 }
 
 fn init_logging() {

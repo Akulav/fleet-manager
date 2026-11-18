@@ -38,7 +38,13 @@ impl Drop for OwnedHandle {
 
 const NO_SESSION: u32 = 0xFFFFFFFF;
 
-pub async fn helper_supervisor(hub: crate::ipc::Hub, shutdown: CancellationToken) {
+use crate::config::SignBridgeSettings;
+
+pub async fn helper_supervisor(
+    hub: crate::ipc::Hub,
+    bridge: Option<SignBridgeSettings>,
+    shutdown: CancellationToken,
+) {
     let mut current: Option<(u32, OwnedHandle)> = None; // (session_id, process handle)
 
     // Wait until the IPC server has bound a port we can hand to the helper.
@@ -83,7 +89,7 @@ pub async fn helper_supervisor(hub: crate::ipc::Hub, shutdown: CancellationToken
             if let Some((_, old)) = current.take() {
                 terminate(&old);
             }
-            match launch_helper_in_session(session, ipc_port, &ipc_token) {
+            match launch_helper_in_session(session, ipc_port, &ipc_token, bridge.as_ref()) {
                 Ok(h) => {
                     tracing::info!("launched helper in session {session}");
                     current = Some((session, h));
@@ -141,6 +147,7 @@ fn launch_helper_in_session(
     session_id: u32,
     ipc_port: u16,
     ipc_token: &str,
+    bridge: Option<&SignBridgeSettings>,
 ) -> windows::core::Result<OwnedHandle> {
     unsafe {
         // Token of the user logged into that session.
@@ -164,15 +171,27 @@ fn launch_helper_in_session(
         let mut env_block: *mut core::ffi::c_void = std::ptr::null_mut();
         let have_env = CreateEnvironmentBlock(&mut env_block, primary.0, false).is_ok();
 
-        // Command line: "<exe>" helper
+        // Command line: "<exe>" helper --ipc-port .. --ipc-token ..
         let exe = std::env::current_exe().map_err(|_| windows::core::Error::from_win32())?;
-        let mut cmdline: Vec<u16> = format!(
+        let mut cmd = format!(
             "\"{}\" helper --ipc-port {ipc_port} --ipc-token {ipc_token}",
             exe.display()
-        )
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+        );
+        // Sign-bridge settings (only when configured). Values come from agent
+        // config / a generated token, not from the network; quote the URL/path
+        // in case they contain spaces.
+        if let Some(b) = bridge {
+            cmd.push_str(&format!(
+                " --emgmt-origin \"{}\" --emgmt-validate-url \"{}\" --sign-bridge-token {}",
+                b.origin, b.validate_url, b.token
+            ));
+            if let Some(path) = b.moldsign_path.as_deref() {
+                if !path.trim().is_empty() {
+                    cmd.push_str(&format!(" --moldsign-path \"{}\"", path));
+                }
+            }
+        }
+        let mut cmdline: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
         let mut si = STARTUPINFOW::default();

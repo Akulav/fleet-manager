@@ -27,6 +27,7 @@ mod paths;
 mod screenshot;
 mod service;
 mod session;
+mod signbridge;
 mod splash;
 mod telemetry;
 mod tls;
