@@ -75,6 +75,7 @@ fn main() {
         }
         "update" => std::process::exit(setup::run_update(rest)),
         "update-worker" => std::process::exit(setup::run_update_worker(rest)),
+        "restart-service" => std::process::exit(setup::run_restart_service()),
         "install" => {
             if let Err(e) = service::install_service() {
                 eprintln!("install failed: {e:#}");

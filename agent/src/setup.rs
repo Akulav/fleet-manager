@@ -483,26 +483,50 @@ fn retry<T>(mut f: impl FnMut() -> std::io::Result<T>) -> Result<T> {
 /// Restart the FleetView service from a detached process, so applying a config
 /// change can take effect (the service loads its config at start and launches
 /// the sign-bridge helper from it). We can't stop our own service inline — that
-/// would kill us mid-call — so hand it to `cmd.exe`, which breaks away and
-/// outlives us. A short delay lets the caller send its reply to the master
-/// first.
+/// would kill us mid-call — so start our own exe in `restart-service` mode,
+/// detached, which outlives us. It waits for the service to really stop before
+/// starting it again (a fixed delay could start it while still stopping, which
+/// fails and leaves the agent stopped).
 pub fn schedule_service_restart() {
     use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
-    let _ = std::process::Command::new("cmd.exe")
-        .raw_arg(concat!(
-            "/d /c ping 127.0.0.1 -n 3 >nul & ",
-            "sc stop FleetViewAgent >nul & ",
-            "ping 127.0.0.1 -n 3 >nul & ",
-            "sc start FleetViewAgent >nul"
-        ))
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
-        .spawn();
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::error!("cannot restart: own exe path unknown");
+        return;
+    };
+    let spawn = |flags: u32| {
+        std::process::Command::new(&exe)
+            .arg("restart-service")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    if let Err(e) = spawn(base | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(base)) {
+        tracing::error!("cannot start the service restarter: {e}");
+    }
+}
+
+/// `restart-service`: the detached half of [`schedule_service_restart`].
+pub fn run_restart_service() -> i32 {
+    service::init_logging("update");
+    // Let the caller send its reply to the master first.
+    std::thread::sleep(Duration::from_secs(2));
+    service::stop_service_and_wait(Duration::from_secs(30));
+    match service::start_service() {
+        Ok(()) => {
+            tracing::info!("service restarted to apply a config change");
+            0
+        }
+        Err(e) => {
+            tracing::error!("service restart failed: {e:#}");
+            1
+        }
+    }
 }
 
 /// Close tray helpers (and a service that didn't stop) so the exe is free.

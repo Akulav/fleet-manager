@@ -118,6 +118,102 @@ pub fn start_update(
     }
 }
 
+/// How a [`send_file_and_wait`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendOutcome {
+    /// The agent acknowledged every byte (a run, if requested, has started).
+    Delivered,
+    /// No connection, or it dropped before the file was confirmed.
+    Offline,
+    TimedOut,
+}
+
+/// Stream `data` to one agent as a file push (run afterwards if `run` is set)
+/// and wait until the agent has acknowledged every byte. Waiting means a
+/// fleet-wide push holds at most one queued copy per worker thread instead of
+/// one per PC, so a big installer can't exhaust the master's memory.
+pub fn send_file_and_wait(
+    state: &SharedState,
+    id: &str,
+    transfer_id: String,
+    file_name: String,
+    data: &[u8],
+    run: Option<RunSpec>,
+) -> SendOutcome {
+    // Register the transfer so the backend records its acks (it ignores acks
+    // for transfers nobody is waiting on).
+    let tx = {
+        let mut s = state.lock().unwrap();
+        let Some(a) = s.agents.get_mut(id) else {
+            return SendOutcome::Offline;
+        };
+        let Some(tx) = a.tx.clone() else {
+            return SendOutcome::Offline;
+        };
+        a.acks.insert(transfer_id.clone(), 0);
+        tx
+    };
+    let total = data.len() as u64;
+    let mut ok = tx
+        .send(MasterMsg::FileBegin {
+            transfer_id: transfer_id.clone(),
+            file_name,
+            total_len: total,
+            run_after: run,
+        })
+        .is_ok();
+    for chunk in data.chunks(CHUNK) {
+        if !ok {
+            break;
+        }
+        ok = tx
+            .send(MasterMsg::FileChunk {
+                transfer_id: transfer_id.clone(),
+                data: chunk.to_vec(),
+            })
+            .is_ok();
+    }
+    ok = ok
+        && tx
+            .send(MasterMsg::FileEnd {
+                transfer_id: transfer_id.clone(),
+            })
+            .is_ok();
+    drop(tx);
+    if !ok || total == 0 {
+        if let Some(a) = state.lock().unwrap().agents.get_mut(id) {
+            a.acks.remove(&transfer_id);
+        }
+        // An empty file has no chunks, so no acks to wait for.
+        return if ok {
+            SendOutcome::Delivered
+        } else {
+            SendOutcome::Offline
+        };
+    }
+
+    let deadline = Instant::now() + ACK_TIMEOUT;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let mut s = state.lock().unwrap();
+        let Some(a) = s.agents.get_mut(id) else {
+            return SendOutcome::Offline;
+        };
+        if a.acks.get(&transfer_id) == Some(&total) {
+            a.acks.remove(&transfer_id);
+            return SendOutcome::Delivered;
+        }
+        if !a.online {
+            a.acks.remove(&transfer_id);
+            return SendOutcome::Offline;
+        }
+        if Instant::now() >= deadline {
+            a.acks.remove(&transfer_id);
+            return SendOutcome::TimedOut;
+        }
+    }
+}
+
 fn set_note(state: &SharedState, id: &str, note: String) {
     if let Some(a) = state.lock().unwrap().agents.get_mut(id) {
         a.update_note = Some(note);
@@ -147,57 +243,26 @@ fn push_one(
         a.update_command = Some(command_id.clone());
         tx
     };
-    let total = image.len() as u64;
-    let mut ok = tx
-        .send(MasterMsg::FileBegin {
-            transfer_id: transfer_id.clone(),
-            file_name: format!("fleetview-agent-{version}.exe"),
-            total_len: total,
-            run_after: Some(RunSpec {
-                command_id,
-                args: args.to_vec(),
-                is_msi: false,
-            }),
-        })
-        .is_ok();
-    for chunk in image.chunks(CHUNK) {
-        if !ok {
-            break;
-        }
-        ok = tx
-            .send(MasterMsg::FileChunk {
-                transfer_id: transfer_id.clone(),
-                data: chunk.to_vec(),
-            })
-            .is_ok();
-    }
-    ok = ok
-        && tx
-            .send(MasterMsg::FileEnd {
-                transfer_id: transfer_id.clone(),
-            })
-            .is_ok();
-    if !ok {
-        set_note(state, id, "connection lost while sending".into());
-        return;
-    }
-
-    // Wait until the agent has the whole file before starting the next one,
-    // so a fleet-wide update doesn't queue a copy per PC in memory.
-    let deadline = Instant::now() + ACK_TIMEOUT;
-    loop {
-        std::thread::sleep(Duration::from_millis(250));
-        let s = state.lock().unwrap();
-        let Some(a) = s.agents.get(id) else { return };
-        if a.last_ack.as_ref() == Some(&(transfer_id.clone(), total)) {
-            break;
-        }
-        // Result already in (e.g. a fast failure), or the PC went away.
-        if a.update_command.is_none() || !a.online {
+    drop(tx);
+    let sent = send_file_and_wait(
+        state,
+        id,
+        transfer_id,
+        format!("fleetview-agent-{version}.exe"),
+        image,
+        Some(RunSpec {
+            command_id,
+            args: args.to_vec(),
+            is_msi: false,
+        }),
+    );
+    match sent {
+        SendOutcome::Delivered => {}
+        SendOutcome::Offline => {
+            set_note(state, id, "connection lost while sending".into());
             return;
         }
-        if Instant::now() >= deadline {
-            drop(s);
+        SendOutcome::TimedOut => {
             set_note(
                 state,
                 id,

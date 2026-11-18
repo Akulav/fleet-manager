@@ -8,8 +8,7 @@
 //! upward. Drawn directly on Win32/GDI so it needs no extra dependency and
 //! doesn't disturb the tray's own message loop (each toast runs on its thread).
 
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -43,8 +42,25 @@ const ACCENT: (u8, u8, u8) = (40, 180, 120);
 const TITLE_RGB: (u8, u8, u8) = (245, 246, 248);
 const BODY_RGB: (u8, u8, u8) = (200, 204, 212);
 
-/// How many toasts are currently on screen (for vertical stacking).
-static ACTIVE: AtomicI32 = AtomicI32::new(0);
+/// Occupied stacking positions (bit n = slot n). A toast takes the lowest free
+/// slot and frees it on close, so toasts closing out of order never make a new
+/// one overlap a still-visible one.
+static SLOTS: Mutex<u32> = Mutex::new(0);
+const MAX_SLOTS: i32 = 6;
+
+fn claim_slot() -> i32 {
+    let mut used = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = (0..MAX_SLOTS)
+        .find(|i| *used & (1 << i) == 0)
+        .unwrap_or(MAX_SLOTS - 1);
+    *used |= 1 << slot;
+    slot
+}
+
+fn release_slot(slot: i32) {
+    let mut used = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
+    *used &= !(1 << slot);
+}
 
 fn rgb(c: (u8, u8, u8)) -> COLORREF {
     COLORREF((c.0 as u32) | ((c.1 as u32) << 8) | ((c.2 as u32) << 16))
@@ -67,6 +83,7 @@ fn icon() -> Option<&'static IconPix> {
 struct ToastText {
     title: Vec<u16>,
     body: Vec<u16>,
+    slot: i32,
 }
 
 /// Show a toast. Returns immediately; the toast lives on its own thread.
@@ -93,13 +110,14 @@ unsafe fn run(title: &str, body: &str) {
     // Registering the same class twice is harmless (second call just fails).
     RegisterClassExW(&wc);
 
-    let slot = ACTIVE.fetch_add(1, Ordering::SeqCst);
+    let slot = claim_slot();
     let (x, y) = position(slot);
 
-    let text = Box::new(ToastText {
+    let text = Box::into_raw(Box::new(ToastText {
         title: wide(title),
         body: wide(body),
-    });
+        slot,
+    }));
 
     let hwnd = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -113,10 +131,12 @@ unsafe fn run(title: &str, body: &str) {
         None,
         None,
         hinstance,
-        Some(Box::into_raw(text) as *const _),
+        Some(text as *const _),
     );
     let Ok(hwnd) = hwnd else {
-        ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        // No window, so no WM_DESTROY: reclaim the text and the slot here.
+        drop(Box::from_raw(text));
+        release_slot(slot);
         return;
     };
 
@@ -161,8 +181,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_PAINT => {
-                let text = &*(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ToastText);
-                paint(hwnd, text);
+                let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ToastText;
+                if ptr.is_null() {
+                    return DefWindowProcW(hwnd, msg, wparam, lparam);
+                }
+                paint(hwnd, &*ptr);
                 LRESULT(0)
             }
             WM_LBUTTONUP | WM_RBUTTONUP => {
@@ -177,9 +200,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_DESTROY => {
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToastText;
                 if !ptr.is_null() {
-                    drop(Box::from_raw(ptr));
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    let text = Box::from_raw(ptr);
+                    release_slot(text.slot);
                 }
-                ACTIVE.fetch_sub(1, Ordering::SeqCst);
                 PostQuitMessage(0);
                 LRESULT(0)
             }

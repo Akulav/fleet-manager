@@ -310,35 +310,31 @@ impl App {
                     let Some(id) = queue.lock().unwrap().pop_front() else {
                         break;
                     };
-                    let tx = {
-                        let s = state.lock().unwrap();
-                        s.agents.get(&id).and_then(|a| a.tx.clone())
-                    };
-                    let Some(tx) = tx else { continue };
                     let run = RunSpec {
                         command_id: App::new_command_id(),
                         args: args.clone(),
                         is_msi,
                     };
-                    let transfer_id = App::new_command_id();
-                    let _ = tx.send(MasterMsg::FileBegin {
-                        transfer_id: transfer_id.clone(),
-                        file_name: file_name.clone(),
-                        total_len: data.len() as u64,
-                        run_after: Some(run),
-                    });
-                    for chunk in data.chunks(256 * 1024) {
-                        if tx
-                            .send(MasterMsg::FileChunk {
-                                transfer_id: transfer_id.clone(),
-                                data: chunk.to_vec(),
-                            })
-                            .is_err()
-                        {
-                            break;
+                    // Waits for the agent's acks before taking the next PC, so
+                    // memory stays bounded however big the fleet is.
+                    let outcome = agentpkg::send_file_and_wait(
+                        &state,
+                        &id,
+                        App::new_command_id(),
+                        file_name.clone(),
+                        &data,
+                        Some(run),
+                    );
+                    if outcome != agentpkg::SendOutcome::Delivered {
+                        if let Ok(mut s) = state.lock() {
+                            let host = s
+                                .agents
+                                .get(&id)
+                                .map(|a| a.hostname.clone())
+                                .unwrap_or(id.clone());
+                            s.log(format!("{host}: {file_name} not delivered ({outcome:?})"));
                         }
                     }
-                    let _ = tx.send(MasterMsg::FileEnd { transfer_id });
                 }));
             }
             for w in workers {
@@ -1316,50 +1312,8 @@ impl App {
         let Some(path) = rfd::FileDialog::new().pick_file() else {
             return;
         };
-        let file_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "installer.exe".into());
-        let is_msi = self.install_is_msi || file_name.to_lowercase().ends_with(".msi");
-        let run = RunSpec {
-            command_id: Self::new_command_id(),
-            args: split_args(&self.install_args),
-            is_msi,
-        };
-
-        // Clone the sender so we can stream the file off the UI thread.
-        let tx = {
-            let s = self.state.lock().unwrap();
-            s.agents.get(id).and_then(|a| a.tx.clone())
-        };
-        let Some(tx) = tx else { return };
-        let transfer_id = Self::new_command_id();
-
-        std::thread::spawn(move || {
-            let data = match std::fs::read(&path) {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-            let total = data.len() as u64;
-            let _ = tx.send(MasterMsg::FileBegin {
-                transfer_id: transfer_id.clone(),
-                file_name,
-                total_len: total,
-                run_after: Some(run),
-            });
-            for chunk in data.chunks(256 * 1024) {
-                if tx
-                    .send(MasterMsg::FileChunk {
-                        transfer_id: transfer_id.clone(),
-                        data: chunk.to_vec(),
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = tx.send(MasterMsg::FileEnd { transfer_id });
-        });
+        // Same path as the fleet-wide push (ack-tracked, logged on failure).
+        self.push_file_to(path, vec![id.to_string()]);
     }
 
     fn confirm_run_all_window(&mut self, ctx: &egui::Context) {

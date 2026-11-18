@@ -118,9 +118,11 @@ seconds.
   `discovery_targets`, `telemetry_interval_secs`, `moldsign_path`. Tick a key,
   set its value (empty clears it), choose *All online* or *Selected PC*, Apply.
   The agent applies only these keys — never its master identity or enrollment
-  secret — and restarts to pick them up. Changing `master_address` /
-  `discovery_targets` to something unreachable will make that PC fall back to
-  discovery; see [Multi-subnet](#multi-subnet).
+  secret — and restarts to pick them up. If a `master_address` stops working
+  (master moved, or a typo), the agent starts alternating it with UDP discovery
+  after 3 failed attempts, so a PC on the master's subnet finds it again; one on
+  another subnet needs a correct address or `discovery_targets` (see
+  [Multi-subnet](#multi-subnet)).
 
 User notifications are shown as FleetView toasts in the bottom-right corner (not
 system message boxes), so they appear above other windows without stealing focus.

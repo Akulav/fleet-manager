@@ -111,6 +111,19 @@ pub fn stop_service_and_wait(timeout: Duration) {
     tracing::warn!("service did not stop within {} s", timeout.as_secs());
 }
 
+/// Start the installed service (no-op if it is already running).
+pub fn start_service() -> anyhow::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+    )?;
+    if service.query_status()?.current_state == ServiceState::Stopped {
+        service.start::<&str>(&[])?;
+    }
+    Ok(())
+}
+
 /// Wait until the service reports Running; error if it stops or times out.
 pub fn wait_running(timeout: Duration) -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;

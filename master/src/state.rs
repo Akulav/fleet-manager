@@ -38,8 +38,8 @@ pub struct AgentView {
     pub update_note: Option<String>,
     /// Command id of the pending remote update (to catch its failure).
     pub update_command: Option<String>,
-    /// Last file-transfer acknowledgement: (transfer id, bytes received).
-    pub last_ack: Option<(String, u64)>,
+    /// Bytes acknowledged per in-flight file transfer (removed by the sender).
+    pub acks: std::collections::HashMap<String, u64>,
 }
 
 impl AgentView {
@@ -61,7 +61,7 @@ impl AgentView {
             agent_version: String::new(),
             update_note: None,
             update_command: None,
-            last_ack: None,
+            acks: std::collections::HashMap::new(),
         }
     }
 

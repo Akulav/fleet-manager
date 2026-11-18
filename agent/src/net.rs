@@ -21,22 +21,50 @@ use crate::ipc::{HelperCommand, HelperEvent, Hub};
 /// Reconnect forever until shutdown.
 pub async fn connection_loop(cfg: AgentConfig, hub: Hub, shutdown: CancellationToken) {
     let mut backoff = 2u64;
+    // Consecutive failed attempts. With a fixed `master_address` that has
+    // stopped working (master moved, or a remote config typo), alternate with
+    // UDP discovery after a few failures instead of being cut off for good.
+    let mut failures = 0u32;
+    let has_fixed = cfg
+        .master_address
+        .as_deref()
+        .is_some_and(|a| !a.trim().is_empty());
     loop {
         if shutdown.is_cancelled() {
             break;
         }
-        match discover_master(&cfg, &shutdown).await {
+        let broadcast = has_fixed && failures >= 3 && failures % 2 == 1;
+        if broadcast {
+            tracing::info!("fixed master address keeps failing; trying discovery");
+        }
+        match discover_master(&cfg, &shutdown, broadcast).await {
             Ok(found) => {
                 tracing::info!("master at {}", found.addr);
+                let started = std::time::Instant::now();
                 match run_session(&cfg, &found, &hub, &shutdown).await {
-                    Ok(()) => backoff = 2,
-                    Err(e) => tracing::warn!("session ended: {e:#}"),
+                    Ok(()) => {
+                        backoff = 2;
+                        failures = 0;
+                    }
+                    Err(e) => {
+                        tracing::warn!("session ended: {e:#}");
+                        // A long, working session that later dropped is not a
+                        // sign of a bad address.
+                        if started.elapsed() > Duration::from_secs(60) {
+                            failures = 0;
+                        } else {
+                            failures += 1;
+                        }
+                    }
                 }
                 // Never keep capturing the user's screen once the master that
                 // asked for it is gone.
                 hub.send_to_helper(HelperCommand::StopStream);
             }
-            Err(e) => tracing::info!("master not found yet: {e:#}"),
+            Err(e) => {
+                tracing::info!("master not found yet: {e:#}");
+                failures += 1;
+            }
         }
         hub.set_connected(false, "").await;
         // Wait before retrying, capped.
@@ -54,13 +82,20 @@ struct FoundMaster {
     name: String,
 }
 
-/// Find the master either via the configured fixed address or UDP discovery.
-async fn discover_master(cfg: &AgentConfig, shutdown: &CancellationToken) -> Result<FoundMaster> {
+/// Find the master either via the configured fixed address or UDP discovery
+/// (`force_broadcast` skips the fixed address for this attempt). Either way the
+/// TLS session that follows pins the master's certificate, so a wrong address
+/// can only fail, never connect us to an impostor.
+async fn discover_master(
+    cfg: &AgentConfig,
+    shutdown: &CancellationToken,
+    force_broadcast: bool,
+) -> Result<FoundMaster> {
     if let Some(addr) = cfg
         .master_address
         .as_deref()
         .map(str::trim)
-        .filter(|a| !a.is_empty())
+        .filter(|a| !a.is_empty() && !force_broadcast)
     {
         // Accept a bare host/IP too and default to the standard port.
         let target = if addr.contains(':') {

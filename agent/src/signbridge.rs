@@ -167,20 +167,17 @@ impl Bridge {
             }
         };
         if !self.token_valid(&token) {
-            let _ = respond_cors(request, json_error(403, "token invalid"), &self.cfg);
+            // 401 (not 403) so the page knows to fetch a fresh token and retry.
+            let _ = respond_cors(request, json_error(401, "token invalid"), &self.cfg);
             return;
         }
 
-        // Route: only the three MoldSign shapes the signing flow needs.
-        let path = url.split('?').next().unwrap_or("");
-        let allowed = matches!(
-            (&method, path),
-            (&Method::Get, p) if p == "/certificates" || p.starts_with("/sign/data/")
-        ) || matches!((&method, path), (&Method::Post, "/sign/data"));
-        if !allowed {
+        // Route: only the three MoldSign shapes the signing flow needs, rebuilt
+        // from validated parts — never the raw URL (no `..`, no extra query).
+        let Some(target_path) = route(&method, &url) else {
             let _ = respond_cors(request, json_error(404, "cerere neacceptată"), &self.cfg);
             return;
-        }
+        };
 
         // Make sure MoldSign is running before we forward.
         if let Err(e) = self.ensure_moldsign() {
@@ -206,7 +203,7 @@ impl Bridge {
             Vec::new()
         };
 
-        match self.forward(&method, &url, body) {
+        match self.forward(&method, &target_path, body) {
             Ok(resp) => {
                 let _ = respond_cors(request, resp, &self.cfg);
             }
@@ -385,6 +382,43 @@ fn locate_moldsign(override_path: Option<&str>) -> Option<String> {
     None
 }
 
+/// Map a browser request to the exact MoldSign path to forward, or `None` if it
+/// isn't one of the three allowed shapes:
+///
+/// * `GET  /certificates[?private_only=true]`
+/// * `POST /sign/data`
+/// * `GET  /sign/data/{provider}/{session}[/{type}]` (the result to poll)
+///
+/// Path segments are restricted to `[A-Za-z0-9._-]` (and not `.`/`..`), so a
+/// crafted URL can't walk to other MoldSign endpoints; percent-encoding is
+/// rejected outright. Any other query string is dropped.
+fn route(method: &Method, url: &str) -> Option<String> {
+    let (path, query) = url.split_once('?').unwrap_or((url, ""));
+    match method {
+        Method::Get if path == "/certificates" => Some(if query == "private_only=true" {
+            "/certificates?private_only=true".into()
+        } else {
+            "/certificates".into()
+        }),
+        Method::Post if path == "/sign/data" && query.is_empty() => Some("/sign/data".into()),
+        Method::Get if query.is_empty() => {
+            let rest = path.strip_prefix("/sign/data/")?;
+            let segs: Vec<&str> = rest.split('/').collect();
+            let ok = (2..=3).contains(&segs.len())
+                && segs.iter().all(|s| {
+                    !s.is_empty()
+                        && s.len() <= 128
+                        && *s != "."
+                        && *s != ".."
+                        && s.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                });
+            ok.then(|| format!("/sign/data/{}", segs.join("/")))
+        }
+        _ => None,
+    }
+}
+
 // --------------------------------------------------------------------------
 // small HTTP helpers
 // --------------------------------------------------------------------------
@@ -467,4 +501,37 @@ fn json_error(status: u16, msg: &str) -> Response<std::io::Cursor<Vec<u8>>> {
         resp = resp.with_header(h);
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_allows_only_the_signing_flow() {
+        let get = Method::Get;
+        let post = Method::Post;
+        assert_eq!(
+            route(&get, "/certificates?private_only=true").as_deref(),
+            Some("/certificates?private_only=true")
+        );
+        assert_eq!(
+            route(&get, "/certificates?x=1").as_deref(),
+            Some("/certificates")
+        );
+        assert_eq!(route(&post, "/sign/data").as_deref(), Some("/sign/data"));
+        assert_eq!(
+            route(&get, "/sign/data/moldsign/ab-12_3/pdf").as_deref(),
+            Some("/sign/data/moldsign/ab-12_3/pdf")
+        );
+        // Traversal, encoding, extra query, wrong method/shape.
+        assert!(route(&get, "/sign/data/../../admin").is_none());
+        assert!(route(&get, "/sign/data/a/%2e%2e").is_none());
+        assert!(route(&get, "/sign/data/a/b?c=1").is_none());
+        assert!(route(&get, "/sign/data/a").is_none());
+        assert!(route(&get, "/sign/data/a/b/c/d").is_none());
+        assert!(route(&post, "/sign/data?x").is_none());
+        assert!(route(&post, "/certificates").is_none());
+        assert!(route(&get, "/settings").is_none());
+    }
 }

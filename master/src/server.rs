@@ -371,7 +371,10 @@ fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
             received,
         } => {
             tracing::debug!("{}: transfer {transfer_id} {received} bytes", a.hostname);
-            a.last_ack = Some((transfer_id, received));
+            // Only transfers a sender registered and is waiting on.
+            if let Some(v) = a.acks.get_mut(&transfer_id) {
+                *v = received;
+            }
         }
         AgentMsg::Heartbeat => {}
         AgentMsg::Log { level, message } => {
