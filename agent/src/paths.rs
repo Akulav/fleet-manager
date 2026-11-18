@@ -25,28 +25,49 @@ pub fn ensure_data_dir() -> std::io::Result<PathBuf> {
 /// Administrators. `%ProgramData%` lets ordinary users read files and create
 /// files/folders in subdirectories by default, which would expose the
 /// enrollment secret and let a user tamper with staged installers that the
-/// service then runs as SYSTEM. The installer does this too; repeating it at
-/// service start makes it robust against manual installs and ACL drift.
+/// service then runs as SYSTEM. Setup does this too; repeating it at service
+/// start makes it robust against manual installs and ACL drift.
+///
+/// Only the folder itself gets explicit entries; everything inside is reset to
+/// inherit them. (Applying `/inheritance:r /grant:r …(OI)(CI)F` recursively
+/// with `/T` — as 0.2.0 and earlier did — strips each *file's* inherited
+/// entries and then can't apply the folder-only `(OI)(CI)` grant, leaving files
+/// with an empty ACL that not even SYSTEM can read: the service then can't
+/// load its config and never starts the tray helper. The reset below also
+/// repairs files damaged that way.)
 pub fn lock_down_data_dir() {
     let dir = data_dir();
-    let result = std::process::Command::new("icacls.exe")
-        .arg(&dir)
-        .args([
+    icacls(
+        &dir.as_os_str().to_string_lossy(),
+        &[
             "/inheritance:r",
             "/grant:r",
             "*S-1-5-18:(OI)(CI)F",     // NT AUTHORITY\SYSTEM
             "*S-1-5-32-544:(OI)(CI)F", // BUILTIN\Administrators
-            "/T",
             "/C",
             "/Q",
-        ])
+        ],
+    );
+    // Children: drop explicit / broken ACLs and inherit from the folder.
+    icacls(
+        &dir.join("*").as_os_str().to_string_lossy(),
+        &["/reset", "/T", "/C", "/Q"],
+    );
+}
+
+fn icacls(target: &str, args: &[&str]) {
+    let result = std::process::Command::new("icacls.exe")
+        .arg(target)
+        .args(args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
     match result {
         Ok(st) if st.success() => {}
-        Ok(st) => tracing::warn!("icacls on {} exited with {st}", dir.display()),
-        Err(e) => tracing::warn!("cannot run icacls on {}: {e}", dir.display()),
+        // Exit code 1 with /C just means "some file was skipped" (e.g. empty
+        // folder for the wildcard); worth a note, not an error.
+        Ok(st) => tracing::warn!("icacls {target} exited with {st}"),
+        Err(e) => tracing::warn!("cannot run icacls on {target}: {e}"),
     }
 }
 
