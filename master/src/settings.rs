@@ -19,6 +19,15 @@ pub struct MasterSettings {
     pub enrollment_secret: String,
     pub master_name: String,
     pub control_port: u16,
+    /// Base URL of the e-Management ANSC server. When set, it goes into new
+    /// agent configs and is applied on remote updates, which turns on the
+    /// agents' MoldSign signing bridge.
+    #[serde(default)]
+    pub emanagement_url: String,
+    /// Agent exe used for setups and remote updates. Empty = the
+    /// `fleetview-agent.exe` installed next to the master.
+    #[serde(default)]
+    pub agent_package_path: String,
 }
 
 impl MasterSettings {
@@ -66,6 +75,8 @@ impl MasterSettings {
             enrollment_secret: fleetview_shared::crypto::random_secret(),
             master_name: format!("FleetView @ {host}"),
             control_port: DEFAULT_CONTROL_PORT,
+            emanagement_url: String::new(),
+            agent_package_path: String::new(),
         })
     }
 
@@ -82,7 +93,7 @@ impl MasterSettings {
 
     /// The JSON an agent needs (`agent.config.json`). The installer bundles this.
     pub fn agent_config_json(&self, master_address: Option<String>) -> anyhow::Result<String> {
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "agent_id": "",
             "master_public_key": self.identity.public_key_b64()?,
             "master_cert_fingerprint": self.cert_fingerprint,
@@ -91,6 +102,11 @@ impl MasterSettings {
             "discovery_targets": [],
             "telemetry_interval_secs": 30
         });
+        // Only when set: an absent key keeps whatever the PC already has.
+        let url = self.emanagement_url.trim();
+        if !url.is_empty() {
+            value["emanagement_url"] = serde_json::Value::String(url.to_string());
+        }
         Ok(serde_json::to_string_pretty(&value)?)
     }
 }

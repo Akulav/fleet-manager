@@ -207,21 +207,30 @@ where
         let entry = s
             .agents
             .entry(agent_id.clone())
-            .or_insert_with(|| AgentView {
-                agent_id: agent_id.clone(),
-                hostname: hello.hostname.clone(),
-                online: false,
-                first_seen: now,
-                last_seen: now,
-                addr: None,
-                telemetry: None,
-                software: Vec::new(),
-                console_output: String::new(),
-                last_frame: None,
-                frame_seq: 0,
-                streaming: false,
-                tx: None,
-            });
+            .or_insert_with(|| AgentView::new(agent_id.clone(), hello.hostname.clone(), now));
+        let previous_version =
+            std::mem::replace(&mut entry.agent_version, hello.agent_version.clone());
+        let updated = !previous_version.is_empty() && previous_version != hello.agent_version;
+        let pending_update = entry.update_command.take().is_some();
+        let version_event = if updated {
+            entry.update_note = Some(format!("updated to {}", hello.agent_version));
+            Some(format!(
+                "{}: agent updated {previous_version} → {}",
+                hello.hostname, hello.agent_version
+            ))
+        } else if pending_update {
+            // Back on the same version: the update worker rolled back.
+            entry.update_note = Some(format!(
+                "update not applied (still {}); see logs\\update.log on the PC",
+                hello.agent_version
+            ));
+            Some(format!(
+                "{}: agent update did not apply (still {})",
+                hello.hostname, hello.agent_version
+            ))
+        } else {
+            None
+        };
         entry.online = true;
         entry.hostname = hello.hostname.clone();
         entry.addr = Some(peer);
@@ -231,6 +240,9 @@ where
             "{} ({}) connected from {peer}",
             hello.hostname, agent_id
         ));
+        if let Some(ev) = version_event {
+            s.log(ev);
+        }
         save_known(&s);
     }
 
@@ -310,6 +322,7 @@ fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
         AgentMsg::Hello(_) => {}
         AgentMsg::Telemetry(t) => {
             a.hostname = t.hostname.clone();
+            a.agent_version = t.agent_version.clone();
             a.telemetry = Some(t);
         }
         AgentMsg::Software(list) => {
@@ -327,6 +340,17 @@ fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
                 text.push_str(&r.stderr);
             }
             push_bounded(&mut a.console_output, &text, CONSOLE_MAX_BYTES);
+            if a.update_command.as_deref() == Some(r.command_id.as_str()) {
+                if r.success {
+                    a.update_note = Some("installing… the agent restarts shortly".into());
+                } else {
+                    a.update_command = None;
+                    let why = r.stderr.lines().next().unwrap_or("").to_string();
+                    a.update_note = Some(format!("update failed: {why}"));
+                    let host = a.hostname.clone();
+                    s.log(format!("{host}: agent update failed: {why}"));
+                }
+            }
         }
         AgentMsg::ScreenFrame {
             width,
@@ -347,6 +371,7 @@ fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
             received,
         } => {
             tracing::debug!("{}: transfer {transfer_id} {received} bytes", a.hostname);
+            a.last_ack = Some((transfer_id, received));
         }
         AgentMsg::Heartbeat => {}
         AgentMsg::Log { level, message } => {

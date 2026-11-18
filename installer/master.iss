@@ -32,6 +32,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Files]
 Source: "..\target\release\fleetview-master.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "assets\master.ico"; DestDir: "{app}"; Flags: ignoreversion
+; The agent package: the master builds agent setups from it and pushes it as
+; the remote update ("Agent updates" in Fleet overview).
+Source: "..\target\release\fleetview-agent.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\FleetView Master"; Filename: "{app}\fleetview-master.exe"; IconFilename: "{app}\master.ico"

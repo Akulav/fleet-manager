@@ -1,10 +1,17 @@
 //! FleetView agent entry point.
 //!
-//! A single executable with several modes, selected by the first argument:
+//! A single executable that is also its own installer and updater. Modes,
+//! selected by the first argument:
 //!
-//!   (none) | run-service   Service control dispatcher (how the SCM starts us).
-//!   install              Register the Windows service (run elevated once).
-//!   uninstall            Remove the Windows service.
+//!   (none) | setup       Install, or update an existing install, from this
+//!                        file (double-click; asks for UAC). `--silent` for
+//!                        scripts. See `setup.rs`.
+//!   update               Remote update pushed by the master: hands off to a
+//!                        detached `update-worker` and returns immediately.
+//!   uninstall            Remove the service, the program and the secrets.
+//!   run-service          Service control dispatcher (how the SCM starts us).
+//!   install              Only register the service at this exe's location
+//!                        (development; `setup` is the real installer).
 //!   console              Run the service worker in the foreground (debugging).
 //!   helper               User-session helper: tray icon, splash, screen capture.
 //!   version              Print version and exit.
@@ -27,6 +34,7 @@ mod paths;
 mod screenshot;
 mod service;
 mod session;
+mod setup;
 mod signbridge;
 mod splash;
 mod telemetry;
@@ -40,14 +48,31 @@ const SERVICE_DISPLAY: &str = "FleetView Agent";
 const SERVICE_DESC: &str =
     "FleetView remote management agent (telemetry, software deployment). Made by Akulav.";
 
+/// Version marker the master and the updater read from the file on disk
+/// (format: see `fleetview_shared::package`).
+static VERSION_MARKER: &str = concat!("FLEETVIEW_AGENT_VERSION=", env!("CARGO_PKG_VERSION"), "\0");
+
 fn main() {
+    // Keep the marker in the binary whatever the optimiser thinks of it.
+    std::hint::black_box(VERSION_MARKER.as_ptr());
+
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mode = args.first().map(|s| s.as_str()).unwrap_or("run-service");
+    // The service is registered with an explicit `run-service`, so a bare
+    // start (double-click) is the installer.
+    let mode = args.first().map(|s| s.as_str()).unwrap_or("setup");
+    let rest = args.get(1..).unwrap_or(&[]);
 
     match mode {
         "version" | "--version" | "-V" => {
             println!("FleetView Agent {}", env!("CARGO_PKG_VERSION"));
         }
+        "setup" => std::process::exit(setup::run_setup(rest)),
+        // Installer-style switch on its own: silent install/update.
+        "/S" | "/s" | "/silent" | "/verysilent" | "--silent" => {
+            std::process::exit(setup::run_setup(&args))
+        }
+        "update" => std::process::exit(setup::run_update(rest)),
+        "update-worker" => std::process::exit(setup::run_update_worker(rest)),
         "install" => {
             if let Err(e) = service::install_service() {
                 eprintln!("install failed: {e:#}");
@@ -55,13 +80,7 @@ fn main() {
             }
             println!("Service installed.");
         }
-        "uninstall" => {
-            if let Err(e) = service::uninstall_service() {
-                eprintln!("uninstall failed: {e:#}");
-                std::process::exit(1);
-            }
-            println!("Service removed.");
-        }
+        "uninstall" => std::process::exit(setup::run_uninstall(rest)),
         "console" => {
             // Foreground run for debugging (Ctrl-C to stop).
             service::init_logging("console");
@@ -84,7 +103,7 @@ fn main() {
             if let Err(e) = run_as_service() {
                 eprintln!(
                     "Not started by the Service Control Manager ({e}).\n\
-                     Use `fleetview-agent install` then start the service, or \
+                     Run `fleetview-agent setup` to install it, or \
                      `fleetview-agent console` to run in the foreground."
                 );
                 std::process::exit(1);

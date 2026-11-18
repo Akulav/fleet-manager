@@ -32,16 +32,24 @@ pub struct AgentView {
     pub frame_seq: u64,
     pub streaming: bool,
     pub tx: Option<UnboundedSender<MasterMsg>>,
+    /// Version the agent reported (Hello / telemetry); kept while offline.
+    pub agent_version: String,
+    /// Progress of a remote update, shown in the UI.
+    pub update_note: Option<String>,
+    /// Command id of the pending remote update (to catch its failure).
+    pub update_command: Option<String>,
+    /// Last file-transfer acknowledgement: (transfer id, bytes received).
+    pub last_ack: Option<(String, u64)>,
 }
 
 impl AgentView {
-    pub fn offline_from(known: &KnownAgent) -> Self {
+    pub fn new(agent_id: String, hostname: String, now: DateTime<Local>) -> Self {
         Self {
-            agent_id: known.agent_id.clone(),
-            hostname: known.hostname.clone(),
+            agent_id,
+            hostname,
             online: false,
-            first_seen: known.first_seen,
-            last_seen: known.last_seen,
+            first_seen: now,
+            last_seen: now,
             addr: None,
             telemetry: None,
             software: Vec::new(),
@@ -50,7 +58,22 @@ impl AgentView {
             frame_seq: 0,
             streaming: false,
             tx: None,
+            agent_version: String::new(),
+            update_note: None,
+            update_command: None,
+            last_ack: None,
         }
+    }
+
+    pub fn offline_from(known: &KnownAgent) -> Self {
+        let mut a = Self::new(
+            known.agent_id.clone(),
+            known.hostname.clone(),
+            known.first_seen,
+        );
+        a.last_seen = known.last_seen;
+        a.agent_version = known.agent_version.clone();
+        a
     }
 
     pub fn send(&self, msg: MasterMsg) {
@@ -105,6 +128,8 @@ pub struct KnownAgent {
     pub hostname: String,
     pub first_seen: DateTime<Local>,
     pub last_seen: DateTime<Local>,
+    #[serde(default)]
+    pub agent_version: String,
 }
 
 pub fn load_known() -> Vec<KnownAgent> {
@@ -123,6 +148,7 @@ pub fn save_known(state: &Shared) {
             hostname: a.hostname.clone(),
             first_seen: a.first_seen,
             last_seen: a.last_seen,
+            agent_version: a.agent_version.clone(),
         })
         .collect();
     if let Ok(text) = serde_json::to_string_pretty(&list) {

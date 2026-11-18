@@ -6,8 +6,12 @@ use eframe::egui;
 
 use fleetview_shared::protocol::{MasterMsg, RunSpec};
 
+use crate::agentpkg::{self, AgentPackage, UpdateState};
 use crate::settings::MasterSettings;
 use crate::state::SharedState;
+
+const GREEN: egui::Color32 = egui::Color32::from_rgb(40, 180, 120);
+const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 160, 40);
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
@@ -44,6 +48,14 @@ pub struct App {
     show_config: bool,
     config_text: String,
     config_master_addr: String,
+    emanagement_input: String,
+    config_status: String,
+
+    // agent package used for setups and remote updates
+    package: Option<AgentPackage>,
+    package_error: String,
+    // "Update agents" awaiting confirmation: target agent ids
+    pending_update: Option<Vec<String>>,
 }
 
 impl App {
@@ -52,7 +64,8 @@ impl App {
         state: SharedState,
         settings: MasterSettings,
     ) -> Self {
-        Self {
+        let emanagement_input = settings.emanagement_url.clone();
+        let mut app = Self {
             state,
             settings,
             selected: None,
@@ -71,6 +84,81 @@ impl App {
             show_config: false,
             config_text: String::new(),
             config_master_addr: String::new(),
+            emanagement_input,
+            config_status: String::new(),
+            package: None,
+            package_error: String::new(),
+            pending_update: None,
+        };
+        app.load_package();
+        app
+    }
+
+    /// (Re)load the agent package from the configured path or the default.
+    fn load_package(&mut self) {
+        let path = if self.settings.agent_package_path.trim().is_empty() {
+            AgentPackage::default_path()
+        } else {
+            std::path::PathBuf::from(self.settings.agent_package_path.trim())
+        };
+        match AgentPackage::load(&path) {
+            Ok(p) => {
+                self.package = Some(p);
+                self.package_error.clear();
+            }
+            Err(e) => {
+                self.package = None;
+                self.package_error = format!("{e:#}");
+            }
+        }
+    }
+
+    fn choose_package(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("FleetView agent", &["exe"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.settings.agent_package_path = path.display().to_string();
+        let _ = self.settings.save();
+        self.load_package();
+    }
+
+    fn update_state_of(&self, agent_version: &str) -> UpdateState {
+        match &self.package {
+            Some(p) => agentpkg::update_state(agent_version, &p.version),
+            None => UpdateState::Unknown,
+        }
+    }
+
+    /// Online agents older than the package.
+    fn outdated_online(&self) -> Vec<String> {
+        let Some(p) = &self.package else {
+            return Vec::new();
+        };
+        let s = self.state.lock().unwrap();
+        s.agents
+            .values()
+            .filter(|a| a.online && a.update_command.is_none())
+            .filter(|a| {
+                // 0.1.x agents report a version too, so "Unknown" here means
+                // no Hello yet: skip until they say who they are.
+                agentpkg::update_state(&a.agent_version, &p.version) == UpdateState::Outdated
+            })
+            .map(|a| a.agent_id.clone())
+            .collect()
+    }
+
+    fn update_agents(&mut self, ids: Vec<String>) {
+        if let Some(p) = &self.package {
+            agentpkg::start_update(
+                self.state.clone(),
+                p,
+                ids,
+                &self.settings.emanagement_url,
+                Self::new_command_id,
+            );
         }
     }
 
@@ -97,6 +185,9 @@ impl eframe::App for App {
         if self.pending_run_all.is_some() {
             self.confirm_run_all_window(ctx);
         }
+        if self.pending_update.is_some() {
+            self.confirm_update_window(ctx);
+        }
     }
 }
 
@@ -105,7 +196,10 @@ impl App {
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("FleetView");
-                ui.label(egui::RichText::new("by Akulav").weak());
+                ui.label(
+                    egui::RichText::new(format!("v{} · by Akulav", env!("CARGO_PKG_VERSION")))
+                        .weak(),
+                );
                 ui.separator();
                 let (online, total, listening, err, name) = {
                     let s = self.state.lock().unwrap();
@@ -132,11 +226,12 @@ impl App {
                     ui.colored_label(egui::Color32::from_rgb(200, 80, 80), e);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Agent installer config").clicked() {
+                    if ui.button("Agent installer").clicked() {
                         self.config_text = self
                             .settings
                             .agent_config_json(None)
                             .unwrap_or_else(|e| format!("error: {e}"));
+                        self.config_status.clear();
                         self.show_config = true;
                     }
                 });
@@ -158,23 +253,31 @@ impl App {
                 }
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    let agents: Vec<(String, String, bool, f32)> = {
+                    let agents: Vec<(String, String, bool, f32, String)> = {
                         let s = self.state.lock().unwrap();
                         s.agents
                             .values()
                             .map(|a| {
                                 let cpu =
                                     a.telemetry.as_ref().map(|t| t.cpu_usage_pct).unwrap_or(0.0);
-                                (a.agent_id.clone(), a.hostname.clone(), a.online, cpu)
+                                (
+                                    a.agent_id.clone(),
+                                    a.hostname.clone(),
+                                    a.online,
+                                    cpu,
+                                    a.agent_version.clone(),
+                                )
                             })
                             .collect()
                     };
-                    for (id, host, online, cpu) in agents {
+                    for (id, host, online, cpu, version) in agents {
                         let dot = if online { "🟢" } else { "⚪" };
+                        let outdated = self.update_state_of(&version) == UpdateState::Outdated;
+                        let mark = if outdated { "  ⬆" } else { "" };
                         let label = if online {
-                            format!("{dot} {host}  ({cpu:.0}%)")
+                            format!("{dot} {host}  ({cpu:.0}%){mark}")
                         } else {
-                            format!("{dot} {host}")
+                            format!("{dot} {host}{mark}")
                         };
                         if ui
                             .selectable_label(self.selected.as_deref() == Some(&id), label)
@@ -197,7 +300,9 @@ impl App {
     fn fleet_overview(&mut self, ui: &mut egui::Ui) {
         ui.heading("Fleet overview");
         ui.add_space(6.0);
-        let rows: Vec<[String; 5]> = {
+        self.updates_panel(ui);
+        ui.add_space(6.0);
+        let rows: Vec<([String; 5], String)> = {
             let s = self.state.lock().unwrap();
             s.agents
                 .values()
@@ -212,16 +317,19 @@ impl App {
                         .as_ref()
                         .and_then(|t| t.logged_in_user.clone())
                         .unwrap_or_default();
-                    [
-                        format!("{} {}", if a.online { "🟢" } else { "⚪" }, a.hostname),
-                        user,
-                        ips,
-                        a.last_seen.format("%Y-%m-%d %H:%M").to_string(),
-                        a.telemetry
-                            .as_ref()
-                            .map(|t| format!("{:.0}% CPU", t.cpu_usage_pct))
-                            .unwrap_or_default(),
-                    ]
+                    (
+                        [
+                            format!("{} {}", if a.online { "🟢" } else { "⚪" }, a.hostname),
+                            user,
+                            ips,
+                            a.last_seen.format("%Y-%m-%d %H:%M").to_string(),
+                            a.telemetry
+                                .as_ref()
+                                .map(|t| format!("{:.0}% CPU", t.cpu_usage_pct))
+                                .unwrap_or_default(),
+                        ],
+                        a.agent_version.clone(),
+                    )
                 })
                 .collect()
         };
@@ -229,7 +337,7 @@ impl App {
         egui::ScrollArea::vertical().show(ui, |ui| {
             egui::Grid::new("fleet_grid")
                 .striped(true)
-                .num_columns(5)
+                .num_columns(6)
                 .spacing([16.0, 6.0])
                 .show(ui, |ui| {
                     ui.strong("Host");
@@ -237,11 +345,13 @@ impl App {
                     ui.strong("IP addresses");
                     ui.strong("Last seen");
                     ui.strong("CPU");
+                    ui.strong("Agent");
                     ui.end_row();
-                    for r in &rows {
+                    for (r, version) in &rows {
                         for cell in r {
                             ui.label(cell);
                         }
+                        self.version_label(ui, version);
                         ui.end_row();
                     }
                 });
@@ -258,6 +368,123 @@ impl App {
                     });
             });
         });
+    }
+
+    fn version_label(&self, ui: &mut egui::Ui, version: &str) {
+        let text = if version.is_empty() { "—" } else { version };
+        match self.update_state_of(version) {
+            UpdateState::Outdated => {
+                ui.colored_label(AMBER, format!("{text} ⬆"))
+                    .on_hover_text("Older than the agent package: can be updated");
+            }
+            UpdateState::Current => {
+                ui.colored_label(GREEN, text);
+            }
+            _ => {
+                ui.label(text);
+            }
+        }
+    }
+
+    /// Agent package + fleet-wide update controls.
+    fn updates_panel(&mut self, ui: &mut egui::Ui) {
+        let outdated = self.outdated_online();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Agent updates");
+                ui.separator();
+                match &self.package {
+                    Some(p) => {
+                        ui.label(format!("Package: agent {}", p.version))
+                            .on_hover_text(p.path.display().to_string());
+                    }
+                    None => {
+                        ui.colored_label(AMBER, "No agent package")
+                            .on_hover_text(&self.package_error);
+                    }
+                }
+                if ui.button("Choose agent exe…").clicked() {
+                    self.choose_package();
+                }
+                if ui
+                    .button("↻")
+                    .on_hover_text("Reload the package file")
+                    .clicked()
+                {
+                    self.load_package();
+                }
+                ui.separator();
+                let n = outdated.len();
+                let btn = ui.add_enabled(
+                    n > 0,
+                    egui::Button::new(format!("⬆ Update {n} outdated online PC(s)")),
+                );
+                if btn.clicked() {
+                    self.pending_update = Some(outdated.clone());
+                }
+            });
+        });
+    }
+
+    fn confirm_update_window(&mut self, ctx: &egui::Context) {
+        let Some(ids) = self.pending_update.clone() else {
+            return;
+        };
+        let version = self
+            .package
+            .as_ref()
+            .map(|p| p.version.to_string())
+            .unwrap_or_default();
+        let hosts: Vec<String> = {
+            let s = self.state.lock().unwrap();
+            ids.iter()
+                .filter_map(|id| s.agents.get(id))
+                .map(|a| format!("{} ({})", a.hostname, a.agent_version))
+                .collect()
+        };
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Update agents?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Install agent {version} on {} PC(s). Each agent restarts (a few seconds \
+                     offline) and rolls back by itself if the new version doesn't start.",
+                    ids.len()
+                ));
+                if !self.settings.emanagement_url.trim().is_empty() {
+                    ui.label(format!(
+                        "MoldSign bridge: e-Management URL set to {}",
+                        self.settings.emanagement_url.trim()
+                    ));
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(200.0)
+                    .show(ui, |ui| {
+                        for h in &hosts {
+                            ui.label(h);
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(format!("Update {} PC(s)", ids.len())).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.pending_update = None;
+                self.update_agents(ids);
+            }
+            Some(false) => self.pending_update = None,
+            None => {}
+        }
     }
 
     fn agent_view(&mut self, ui: &mut egui::Ui, id: &str) {
@@ -302,6 +529,8 @@ impl App {
         if ui.button("↻ Refresh telemetry").clicked() {
             self.send_to(id, MasterMsg::RequestTelemetry);
         }
+        ui.add_space(6.0);
+        self.agent_update_row(ui, id);
         ui.add_space(6.0);
         let t = {
             let s = self.state.lock().unwrap();
@@ -385,6 +614,50 @@ impl App {
                         body: self.notify_body.clone(),
                     },
                 );
+            }
+        });
+    }
+
+    /// Version of one agent + its update button and progress.
+    fn agent_update_row(&mut self, ui: &mut egui::Ui, id: &str) {
+        let (version, online, note, busy) = {
+            let s = self.state.lock().unwrap();
+            match s.agents.get(id) {
+                Some(a) => (
+                    a.agent_version.clone(),
+                    a.online,
+                    a.update_note.clone(),
+                    a.update_command.is_some(),
+                ),
+                None => return,
+            }
+        };
+        let state = self.update_state_of(&version);
+        let pkg_version = self.package.as_ref().map(|p| p.version);
+        ui.horizontal(|ui| {
+            ui.strong("Agent");
+            self.version_label(ui, &version);
+            if let Some(pv) = pkg_version {
+                let label = match state {
+                    UpdateState::Outdated => format!("⬆ Update to {pv}"),
+                    _ => format!("Reinstall {pv}"),
+                };
+                // Never downgrade from the UI.
+                let enabled = online && !busy && state != UpdateState::Newer;
+                if ui
+                    .add_enabled(enabled, egui::Button::new(label))
+                    .on_disabled_hover_text(if state == UpdateState::Newer {
+                        "The agent is newer than the package"
+                    } else {
+                        "The agent must be online"
+                    })
+                    .clicked()
+                {
+                    self.update_agents(vec![id.to_string()]);
+                }
+            }
+            if let Some(n) = note {
+                ui.label(egui::RichText::new(n).weak());
             }
         });
     }
@@ -746,29 +1019,67 @@ impl App {
 
     fn config_window(&mut self, ctx: &egui::Context) {
         let mut open = self.show_config;
-        egui::Window::new("Agent installer configuration")
+        egui::Window::new("Agent installer")
             .open(&mut open)
-            .default_width(520.0)
+            .default_width(560.0)
             .show(ctx, |ui| {
                 ui.label(
-                    "Bundle this as agent.config.json with the agent installer. It pins this \
-                     master's identity so agents trust only this master.",
+                    "“Save agent setup” writes one .exe that installs the agent (or updates it) \
+                     on double-click. It carries the config below, which pins this master's \
+                     identity so agents trust only this master.",
                 );
-                ui.horizontal(|ui| {
-                    ui.label("Fixed master address (optional, host:port):");
-                    ui.text_edit_singleline(&mut self.config_master_addr);
-                    if ui.button("Apply").clicked() {
-                        let addr = if self.config_master_addr.trim().is_empty() {
-                            None
-                        } else {
-                            Some(self.config_master_addr.trim().to_string())
+                ui.add_space(4.0);
+                let mut regenerate = false;
+                egui::Grid::new("cfg_fields")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Fixed master address (optional, host:port):");
+                        if ui
+                            .text_edit_singleline(&mut self.config_master_addr)
+                            .lost_focus()
+                        {
+                            regenerate = true;
+                        }
+                        ui.end_row();
+                        ui.label("e-Management URL (MoldSign bridge, optional):")
+                            .on_hover_text(
+                                "e.g. http://docs.ansc.local:3080 — turns on document signing \
+                                 through the agent. Also applied by remote updates.",
+                            );
+                        if ui
+                            .text_edit_singleline(&mut self.emanagement_input)
+                            .lost_focus()
+                        {
+                            regenerate = true;
+                        }
+                        ui.end_row();
+                    });
+                if regenerate || ui.button("Apply").clicked() {
+                    let url = self.emanagement_input.trim().to_string();
+                    let valid =
+                        url.is_empty() || url.starts_with("http://") || url.starts_with("https://");
+                    if !valid {
+                        self.config_status = "The e-Management URL must start with http:// or \
+                                              https://"
+                            .into();
+                    } else if url != self.settings.emanagement_url {
+                        self.settings.emanagement_url = url;
+                        self.config_status = match self.settings.save() {
+                            Ok(()) => "Saved.".into(),
+                            Err(e) => format!("Cannot save settings: {e:#}"),
                         };
-                        self.config_text = self
-                            .settings
-                            .agent_config_json(addr)
-                            .unwrap_or_else(|e| format!("error: {e}"));
                     }
-                });
+                    let addr = if self.config_master_addr.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.config_master_addr.trim().to_string())
+                    };
+                    self.config_text = self
+                        .settings
+                        .agent_config_json(addr)
+                        .unwrap_or_else(|e| format!("error: {e}"));
+                }
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .max_height(260.0)
@@ -780,10 +1091,17 @@ impl App {
                         );
                     });
                 ui.horizontal(|ui| {
-                    if ui.button("Copy to clipboard").clicked() {
+                    let save_setup = ui.add_enabled(
+                        self.package.is_some(),
+                        egui::Button::new("💾 Save agent setup (.exe)…"),
+                    );
+                    if save_setup.clicked() {
+                        self.save_agent_setup();
+                    }
+                    if ui.button("Copy config").clicked() {
                         ui.ctx().copy_text(self.config_text.clone());
                     }
-                    if ui.button("Save to file…").clicked() {
+                    if ui.button("Save config as JSON…").clicked() {
                         if let Some(path) = rfd::FileDialog::new()
                             .set_file_name("agent.config.json")
                             .save_file()
@@ -792,6 +1110,26 @@ impl App {
                         }
                     }
                 });
+                match &self.package {
+                    Some(p) => ui.label(
+                        egui::RichText::new(format!(
+                            "Agent package {} — {}",
+                            p.version,
+                            p.path.display()
+                        ))
+                        .weak(),
+                    ),
+                    None => ui.colored_label(
+                        AMBER,
+                        format!(
+                            "No agent package ({}). Use “Choose agent exe…” in Fleet overview.",
+                            self.package_error
+                        ),
+                    ),
+                };
+                if !self.config_status.is_empty() {
+                    ui.label(&self.config_status);
+                }
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(
@@ -801,6 +1139,31 @@ impl App {
                 );
             });
         self.show_config = open;
+    }
+
+    fn save_agent_setup(&mut self) {
+        let Some(p) = &self.package else { return };
+        let bytes = match p.setup_with_config(&self.config_text) {
+            Ok(b) => b,
+            Err(e) => {
+                self.config_status = format!("{e:#}");
+                return;
+            }
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name(format!("FleetViewAgent-Setup-{}.exe", p.version))
+            .add_filter("Program", &["exe"])
+            .save_file()
+        else {
+            return;
+        };
+        self.config_status = match std::fs::write(&path, bytes) {
+            Ok(()) => format!(
+                "Saved {}. Keep it private: it contains the enrollment secret.",
+                path.display()
+            ),
+            Err(e) => format!("Cannot write {}: {e}", path.display()),
+        };
     }
 }
 

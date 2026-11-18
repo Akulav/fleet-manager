@@ -29,7 +29,7 @@ const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 /// Upper bound for a pushed or downloaded file.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-fn audit(line: &str) {
+pub fn audit(line: &str) {
     let path = paths::data_dir().join("audit.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)

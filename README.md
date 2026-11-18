@@ -43,6 +43,11 @@ the LAN even when IP addresses change.
   secret, so agents trust only *your* master.
 - **Always-on agent** — runs as a LocalSystem Windows service, auto-starts at
   boot, and restarts automatically if it stops.
+- **One exe, remote updates** — the agent exe installs and updates itself (no
+  installer); the master shows every agent's version and pushes updates to
+  outdated PCs, with automatic rollback if a new version doesn't start.
+- **MoldSign signing bridge** — optional: lets e-Management ANSC sign documents
+  with the user's token through the agent (set the e-Management URL in the master).
 - **Localized** — the master app is **English**; the agent tray/splash default to
   **Romanian**.
 
@@ -53,46 +58,50 @@ the LAN even when IP addresses change.
 | `shared/` | Wire protocol, crypto/identity, discovery message format. |
 | `agent/`  | The agent: Windows service + user-session tray/splash/capture helper. |
 | `master/` | The `egui` desktop control app. |
-| `installer/` | Inno Setup scripts + branding assets (icons, splash). |
+| `installer/` | Master Inno Setup script + branding assets (icons, splash). |
 | `.github/workflows/` | CI build and tagged `.exe` auto-releases. |
 | `docs/` | Setup, security and architecture notes. |
 
 ## Quick start
 
-1. **Build or download** the two installers (see [docs/SETUP.md](docs/SETUP.md)).
-2. **Run the master** (`FleetViewMaster-Setup`). On first launch it generates its
-   identity, TLS certificate and an enrollment secret.
-3. In the master, click **“Agent installer config”** and save `agent.config.json`
-   next to `agent.iss` (or into the agent install folder). This pins your master.
-4. **Install the agent** on each PC (`FleetViewAgent-Setup`, run as admin). It
-   registers the service, shows the logon splash, and appears in the tray.
-5. Agents discover the master and appear in the list. Select one to see telemetry,
+1. **Install the master** (`FleetViewMaster-Setup`). On first launch it generates
+   its identity, TLS certificate and an enrollment secret.
+2. In the master, click **“Agent installer”** → **“Save agent setup (.exe)…”**.
+   That one file is the agent: it carries the config that pins your master.
+3. **Double-click it on each PC** (UAC prompt; `/S` for silent). It installs the
+   service, shows the logon splash, and appears in the tray. Running it again,
+   or a newer one, updates the agent in place.
+4. Agents discover the master and appear in the list. Select one to see telemetry,
    push software, run PowerShell, or view the screen.
+5. **Updates:** after upgrading the master, *Fleet overview* → **“⬆ Update N
+   outdated online PC(s)”** pushes the new agent to every PC remotely.
 
 See [docs/SETUP.md](docs/SETUP.md) for the full walkthrough and
 [docs/SECURITY.md](docs/SECURITY.md) for the trust model and hardening steps.
 
 ## Building from source
 
-Requires the Rust MSVC toolchain and (for installers) Inno Setup 6.
+Requires the Rust MSVC toolchain (and Inno Setup 6 for the master installer).
 
 ```bash
 cargo build --workspace --release
 ```
 
 Binaries land in `target/release/` (`fleetview-master.exe`, `fleetview-agent.exe`).
-Build the installers with the scripts in `installer/` (see
-[docs/SETUP.md](docs/SETUP.md)).
+The agent exe needs no installer; build the master's with `installer/master.iss`
+(see [docs/SETUP.md](docs/SETUP.md)).
 
 ## Releases
 
-Pushing a tag like `v0.1.0` triggers `.github/workflows/release.yml`, which builds
-the release binaries, compiles both Inno Setup installers, and attaches the
-`.exe` files to a GitHub Release.
+One version for everything: `[workspace.package] version` in `Cargo.toml`. Bump
+it, commit, then push the matching tag; `.github/workflows/release.yml` checks
+the tag against `Cargo.toml`, builds and tests, and publishes
+`FleetViewMaster-Setup-x.y.z.exe` (with the agent package),
+`FleetViewAgent-x.y.z.exe` and `fleetview-master.exe`.
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 ## License

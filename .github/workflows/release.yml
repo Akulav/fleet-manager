@@ -14,13 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version from tag
+      # One version for everything: `version` in the workspace Cargo.toml. The
+      # tag must match it, so the exe, the master's update check and the
+      # release name can never disagree.
+      - name: Check tag matches Cargo.toml version
         id: ver
         shell: pwsh
         run: |
-          $v = "${{ github.ref_name }}".TrimStart("v")
-          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          echo "FLEETVIEW_VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($tag -ne $cargo) {
+            Write-Error "Tag v$tag does not match Cargo.toml version $cargo. Bump [workspace.package] version first."
+            exit 1
+          }
+          "version=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          echo "FLEETVIEW_VERSION=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,28 +38,36 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      - name: Test
+        run: cargo test --workspace
+
       - name: Build release binaries
         run: cargo build --workspace --release
+
+      - name: Check the agent's embedded version
+        shell: pwsh
+        run: |
+          $want = "FLEETVIEW_AGENT_VERSION=${env:FLEETVIEW_VERSION}"
+          $bytes = [System.IO.File]::ReadAllBytes("target\release\fleetview-agent.exe")
+          $text = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if (-not $text.Contains($want)) { Write-Error "agent exe lacks $want"; exit 1 }
 
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
 
-      - name: Build agent installer
-        working-directory: installer
-        run: |
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" agent.iss
-
+      # The master installer also carries the agent exe (its update package).
       - name: Build master installer
         working-directory: installer
         run: |
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" master.iss
 
-      - name: Stage raw executables
+      # The agent needs no installer: the exe installs and updates itself.
+      - name: Stage executables
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\fleetview-agent.exe  dist\fleetview-agent.exe
-          Copy-Item target\release\fleetview-master.exe dist\fleetview-master.exe
+          Copy-Item target\release\fleetview-agent.exe  "dist\FleetViewAgent-${env:FLEETVIEW_VERSION}.exe"
+          Copy-Item target\release\fleetview-master.exe "dist\fleetview-master.exe"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
@@ -59,7 +75,6 @@ jobs:
           name: FleetView ${{ steps.ver.outputs.version }}
           generate_release_notes: true
           files: |
-            dist/FleetViewAgent-Setup-*.exe
             dist/FleetViewMaster-Setup-*.exe
-            dist/fleetview-agent.exe
+            dist/FleetViewAgent-*.exe
             dist/fleetview-master.exe

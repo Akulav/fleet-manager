@@ -19,12 +19,17 @@ const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 /// Install the service to run as LocalSystem, auto-start at boot, and restart on
 /// failure. Must be run elevated.
 pub fn install_service() -> anyhow::Result<()> {
+    install_service_at(&std::env::current_exe()?)
+}
+
+/// Register (or re-point) the service at `exe` and start it.
+pub fn install_service_at(exe: &std::path::Path) -> anyhow::Result<()> {
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
 
-    let exe = std::env::current_exe()?;
+    let exe = exe.to_path_buf();
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
         display_name: SERVICE_DISPLAY.into(),
@@ -80,6 +85,56 @@ fn configure_recovery() -> anyhow::Result<()> {
         .status()
         .context("sc.exe failure")?;
     Ok(())
+}
+
+/// Stop the service (if installed and running) and wait until it has stopped.
+pub fn stop_service_and_wait(timeout: Duration) {
+    let Ok(manager) = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)
+    else {
+        return;
+    };
+    let Ok(service) = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) else {
+        return; // not installed
+    };
+    let _ = service.stop();
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match service.query_status() {
+            Ok(s) if s.current_state == ServiceState::Stopped => return,
+            Ok(_) => std::thread::sleep(Duration::from_millis(300)),
+            Err(_) => return,
+        }
+    }
+    tracing::warn!("service did not stop within {} s", timeout.as_secs());
+}
+
+/// Wait until the service reports Running; error if it stops or times out.
+pub fn wait_running(timeout: Duration) -> anyhow::Result<()> {
+    let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+    let service = manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS)?;
+    let deadline = std::time::Instant::now() + timeout;
+    // Give a crashing build the chance to actually crash before we believe it.
+    let mut running_since: Option<std::time::Instant> = None;
+    while std::time::Instant::now() < deadline {
+        match service.query_status()?.current_state {
+            ServiceState::Running => {
+                let since = *running_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(3) {
+                    return Ok(());
+                }
+            }
+            ServiceState::Stopped => anyhow::bail!("the service stopped right after starting"),
+            _ => running_since = None,
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    anyhow::bail!(
+        "the service did not reach Running within {} s",
+        timeout.as_secs()
+    )
 }
 
 pub fn uninstall_service() -> anyhow::Result<()> {
@@ -187,6 +242,7 @@ pub async fn worker_main(shutdown: CancellationToken) {
         tracing::error!("cannot create data dir: {e:#}");
     }
     paths::lock_down_data_dir();
+    crate::setup::cleanup_leftovers();
     // Leftovers from a previous run (crash / power loss mid-install).
     let _ = std::fs::remove_dir_all(paths::staging_dir());
     let _ = std::fs::create_dir_all(paths::staging_dir());

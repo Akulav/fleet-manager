@@ -7,6 +7,7 @@
 
 pub mod crypto;
 pub mod discovery;
+pub mod package;
 pub mod protocol;
 
 /// UDP port agents broadcast on to discover the master.
