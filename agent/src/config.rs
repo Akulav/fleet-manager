@@ -139,6 +139,80 @@ impl AgentConfig {
     }
 }
 
+/// Config keys the master may change remotely (via `MasterMsg::SetConfig`).
+/// Trust material — `master_public_key`, `master_cert_fingerprint`,
+/// `enrollment_secret`, `agent_id` — is deliberately absent: it can only come
+/// from a master-generated config, never from a live message.
+pub const REMOTE_SETTABLE_KEYS: &[&str] = &[
+    "emanagement_url",
+    "moldsign_path",
+    "telemetry_interval_secs",
+    "master_address",
+    "discovery_targets",
+];
+
+/// Apply remote config changes to `agent.config.json`. Returns the keys
+/// actually changed (empty = nothing to do). Unknown or forbidden keys are an
+/// error, so a typo can't silently do nothing. The merged document must still
+/// be a valid [`AgentConfig`] before it is written.
+pub fn apply_remote_config(updates: &[(String, Option<String>)]) -> anyhow::Result<Vec<String>> {
+    use anyhow::{bail, Context};
+    use serde_json::{Map, Value};
+
+    let path = paths::config_path();
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut doc: Map<String, Value> = serde_json::from_str(&text)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+
+    let mut changed = Vec::new();
+    for (key, value) in updates {
+        let key = key.trim();
+        if !REMOTE_SETTABLE_KEYS.contains(&key) {
+            bail!("`{key}` cannot be set remotely");
+        }
+        let new_value = parse_config_value(key, value.as_deref())?;
+        if doc.get(key) != Some(&new_value) {
+            doc.insert(key.to_string(), new_value);
+            changed.push(key.to_string());
+        }
+    }
+    if changed.is_empty() {
+        return Ok(changed);
+    }
+
+    // Reject a change that would make the config unloadable, before writing.
+    serde_json::from_value::<AgentConfig>(Value::Object(doc.clone()))
+        .context("the resulting config would be invalid")?;
+
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&doc)?)?;
+    std::fs::rename(&tmp, &path).context("replace config")?;
+    Ok(changed)
+}
+
+/// Turn a remote string into the JSON value a key expects. An empty value
+/// clears the key (JSON null), which for optional keys restores the default.
+fn parse_config_value(key: &str, value: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    use serde_json::Value;
+    let v = value.map(str::trim).filter(|s| !s.is_empty());
+    Ok(match (key, v) {
+        (_, None) => Value::Null,
+        ("telemetry_interval_secs", Some(s)) => Value::from(
+            s.parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("telemetry_interval_secs must be a whole number"))?,
+        ),
+        ("discovery_targets", Some(s)) => Value::Array(
+            s.split([',', ';', '\n'])
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(|t| Value::String(t.to_string()))
+                .collect(),
+        ),
+        (_, Some(s)) => Value::String(s.to_string()),
+    })
+}
+
 fn load_or_create_agent_id() -> String {
     let path = paths::agent_id_path();
     if let Ok(id) = std::fs::read_to_string(&path) {

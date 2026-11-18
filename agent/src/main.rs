@@ -30,6 +30,8 @@ mod helper;
 mod inventory;
 mod ipc;
 mod net;
+mod notify;
+mod overlay;
 mod paths;
 mod screenshot;
 mod service;

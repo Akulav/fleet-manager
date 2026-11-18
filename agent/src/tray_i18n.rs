@@ -29,6 +29,8 @@ pub struct Strings {
     pub live_view_stopped: &'static str,
     pub screenshot_taken: &'static str,
     pub tooltip_viewing: &'static str,
+    /// Watermark shown across the screen while it is being viewed/captured.
+    pub overlay_watermark: &'static str,
 }
 
 pub fn strings(lang: Lang) -> Strings {
@@ -50,6 +52,7 @@ pub fn strings(lang: Lang) -> Strings {
             live_view_stopped: "Vizualizarea ecranului de către administrator s-a încheiat.",
             screenshot_taken: "Un administrator a făcut o captură a acestui ecran.",
             tooltip_viewing: "FleetView — ecranul este vizualizat de un administrator",
+            overlay_watermark: "Acest ecran este vizualizat de un administrator — FleetView",
         },
         Lang::En => Strings {
             tooltip_connected: "FleetView — connected to",
@@ -68,6 +71,7 @@ pub fn strings(lang: Lang) -> Strings {
             live_view_stopped: "The administrator has stopped viewing this screen.",
             screenshot_taken: "An administrator took a screenshot of this screen.",
             tooltip_viewing: "FleetView — screen is being viewed by an administrator",
+            overlay_watermark: "This screen is being viewed by an administrator — FleetView",
         },
     }
 }

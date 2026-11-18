@@ -391,8 +391,74 @@ async fn handle_master_msg(
         MasterMsg::NotifyUser { title, body } => {
             hub.send_to_helper(HelperCommand::Notify { title, body });
         }
+        MasterMsg::SetConfig {
+            command_id,
+            updates,
+        } => {
+            let tx = tx_out.clone();
+            tokio::spawn(async move {
+                let result = apply_config(command_id, updates).await;
+                let _ = tx.send(AgentMsg::CommandResult(result)).await;
+            });
+        }
     }
     let _ = cfg; // reserved for future per-command policy checks
+}
+
+/// Apply a remote config change on a blocking thread, then schedule a service
+/// restart so it takes effect. The result reaches the master before the restart
+/// drops the connection; the agent reconnects a few seconds later with the new
+/// settings.
+async fn apply_config(
+    command_id: String,
+    updates: Vec<fleetview_shared::protocol::ConfigUpdate>,
+) -> fleetview_shared::protocol::CommandResult {
+    use fleetview_shared::protocol::CommandResult;
+    let pairs: Vec<(String, Option<String>)> =
+        updates.into_iter().map(|u| (u.key, u.value)).collect();
+    let outcome =
+        tokio::task::spawn_blocking(move || crate::config::apply_remote_config(&pairs)).await;
+    match outcome {
+        Ok(Ok(changed)) if changed.is_empty() => CommandResult {
+            command_id,
+            success: true,
+            exit_code: Some(0),
+            stdout: "config unchanged (values already set)".into(),
+            stderr: String::new(),
+        },
+        Ok(Ok(changed)) => {
+            crate::commands::audit(&format!("config changed remotely: {}", changed.join(", ")));
+            tracing::info!(
+                "config changed ({}); restarting service",
+                changed.join(", ")
+            );
+            crate::setup::schedule_service_restart();
+            CommandResult {
+                command_id,
+                success: true,
+                exit_code: Some(0),
+                stdout: format!(
+                    "updated {}; the agent restarts to apply it",
+                    changed.join(", ")
+                ),
+                stderr: String::new(),
+            }
+        }
+        Ok(Err(e)) => CommandResult {
+            command_id,
+            success: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("{e:#}"),
+        },
+        Err(e) => CommandResult {
+            command_id,
+            success: false,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: format!("apply config task failed: {e}"),
+        },
+    }
 }
 
 async fn report_failure(tx: &mpsc::Sender<AgentMsg>, command_id: Option<String>, msg: String) {

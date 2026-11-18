@@ -48,6 +48,12 @@ the LAN even when IP addresses change.
   outdated PCs, with automatic rollback if a new version doesn't start.
 - **MoldSign signing bridge** — optional: lets e-Management ANSC sign documents
   with the user's token through the agent (set the e-Management URL in the master).
+- **Fleet actions & remote config** — push one installer or URL to every online
+  PC at once, and change a few agent settings (e-Management URL, master address,
+  discovery, telemetry interval) on running PCs without reinstalling.
+- **Visible remote viewing** — while the screen is captured or streamed, the
+  agent shows a red frame + watermark across the desktop and a toast; nothing is
+  hidden from the user.
 - **Localized** — the master app is **English**; the agent tray/splash default to
   **Romanian**.
 

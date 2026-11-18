@@ -480,6 +480,31 @@ fn retry<T>(mut f: impl FnMut() -> std::io::Result<T>) -> Result<T> {
     }
 }
 
+/// Restart the FleetView service from a detached process, so applying a config
+/// change can take effect (the service loads its config at start and launches
+/// the sign-bridge helper from it). We can't stop our own service inline — that
+/// would kill us mid-call — so hand it to `cmd.exe`, which breaks away and
+/// outlives us. A short delay lets the caller send its reply to the master
+/// first.
+pub fn schedule_service_restart() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let _ = std::process::Command::new("cmd.exe")
+        .raw_arg(concat!(
+            "/d /c ping 127.0.0.1 -n 3 >nul & ",
+            "sc stop FleetViewAgent >nul & ",
+            "ping 127.0.0.1 -n 3 >nul & ",
+            "sc start FleetViewAgent >nul"
+        ))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn();
+}
+
 /// Close tray helpers (and a service that didn't stop) so the exe is free.
 /// Never kills this process.
 fn kill_agent_processes() {

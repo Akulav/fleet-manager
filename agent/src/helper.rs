@@ -45,6 +45,9 @@ pub fn run() {
     init_logging();
     tracing::info!("helper starting (ipc port {port})");
 
+    // Start the "your screen is being viewed" indicator (shown only on demand).
+    crate::overlay::init(tray_i18n::strings(TRAY_LANG).overlay_watermark);
+
     // Optional document-signing bridge (browser → helper → MoldSign). Only
     // started when the service provisioned e-Management settings; otherwise the
     // helper runs exactly as before.
@@ -255,6 +258,7 @@ async fn ipc_session(port: u16, token: &str, ui_tx: &mpsc::Sender<UiMsg>) -> any
                             title: s.view_title.into(),
                             body: s.screenshot_taken.into(),
                         });
+                        crate::overlay::flash();
                         let out = out_tx.clone();
                         tokio::spawn(async move {
                             if let Some(ev) = capture_event(Some(command_id), 70).await {
@@ -271,6 +275,7 @@ async fn ipc_session(port: u16, token: &str, ui_tx: &mpsc::Sender<UiMsg>) -> any
                                     body: s.live_view_started.into(),
                                 });
                                 let _ = ui_tx.send(UiMsg::Viewing(true));
+                                crate::overlay::set_viewing(true);
                             }
                         }
                         let out = out_tx.clone();
@@ -289,6 +294,7 @@ async fn ipc_session(port: u16, token: &str, ui_tx: &mpsc::Sender<UiMsg>) -> any
                         if let Some(t) = stream_task.take() {
                             t.abort();
                             let _ = ui_tx.send(UiMsg::Viewing(false));
+                            crate::overlay::set_viewing(false);
                         }
                     }
                     HelperCommand::Notify { title, body } => {
@@ -306,6 +312,7 @@ async fn ipc_session(port: u16, token: &str, ui_tx: &mpsc::Sender<UiMsg>) -> any
     if let Some(t) = stream_task.take() {
         t.abort();
     }
+    crate::overlay::set_viewing(false);
     Ok(accepted)
 }
 
@@ -404,7 +411,7 @@ fn tray_loop(ui_rx: mpsc::Receiver<UiMsg>) {
         let mut changed = false;
         while let Ok(msg) = ui_rx.try_recv() {
             match msg {
-                UiMsg::Notify { title, body } => show_message_box(&title, &body),
+                UiMsg::Notify { title, body } => crate::notify::show(&title, &body),
                 UiMsg::Status {
                     connected: c,
                     master: m,

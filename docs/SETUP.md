@@ -107,7 +107,23 @@ seconds.
   silent; some apps still show UI in session 0).
 - **PowerShell** — *PowerShell* tab, optionally *Run on ALL online agents*.
 - **Screen** — *Screen* tab → *Capture once* or *Start live view*. The user is
-  notified for every screenshot and when live view begins.
+  notified for every screenshot and when live view begins, and while the screen
+  is being viewed a **red frame and a watermark bar** are shown across their
+  desktop (click-through, so it doesn't get in the way) — remote viewing is
+  deliberately impossible to miss.
+- **Fleet actions** (Fleet overview) — push one installer or an https URL to
+  **every online PC** at once (same silent args), and open **Remote config**.
+- **Remote config** — change a few agent settings on running PCs without
+  reinstalling: `emanagement_url` (the MoldSign bridge), `master_address`,
+  `discovery_targets`, `telemetry_interval_secs`, `moldsign_path`. Tick a key,
+  set its value (empty clears it), choose *All online* or *Selected PC*, Apply.
+  The agent applies only these keys — never its master identity or enrollment
+  secret — and restarts to pick them up. Changing `master_address` /
+  `discovery_targets` to something unreachable will make that PC fall back to
+  discovery; see [Multi-subnet](#multi-subnet).
+
+User notifications are shown as FleetView toasts in the bottom-right corner (not
+system message boxes), so they appear above other windows without stealing focus.
 
 ### Silent-install switches (cheat sheet)
 

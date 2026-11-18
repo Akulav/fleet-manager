@@ -118,8 +118,23 @@ pub enum MasterMsg {
         title: String,
         body: String,
     },
+    /// Change a few non-security keys in the agent's config and apply them
+    /// (restarting the service when needed). The agent only honours the keys
+    /// in its own allow-list; trust material (master key, cert fingerprint,
+    /// enrollment secret, agent_id) is ignored. `None` clears a key.
+    SetConfig {
+        command_id: String,
+        updates: Vec<ConfigUpdate>,
+    },
     /// Request the agent to re-run discovery (e.g. master moved).
     Ping,
+}
+
+/// One remote config change: set `key` to `value`, or clear it when `None`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigUpdate {
+    pub key: String,
+    pub value: Option<String>,
 }
 
 /// How to execute a pushed/downloaded file.

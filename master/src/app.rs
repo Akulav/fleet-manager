@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use eframe::egui;
 
-use fleetview_shared::protocol::{MasterMsg, RunSpec};
+use fleetview_shared::protocol::{ConfigUpdate, MasterMsg, RunSpec};
 
 use crate::agentpkg::{self, AgentPackage, UpdateState};
 use crate::settings::MasterSettings;
@@ -56,6 +56,62 @@ pub struct App {
     package_error: String,
     // "Update agents" awaiting confirmation: target agent ids
     pending_update: Option<Vec<String>>,
+
+    // Remote config editor
+    show_remote_cfg: bool,
+    rc_scope_all: bool,
+    rc: [ConfigField; 5],
+    rc_status: String,
+    // "Install on ALL online" awaiting confirmation: (file path or URL, is_url)
+    pending_install_all: Option<(String, bool)>,
+}
+
+/// One row in the remote-config editor: a key, whether to apply it, and its
+/// value. The key names match the agent's `REMOTE_SETTABLE_KEYS`.
+#[derive(Clone)]
+struct ConfigField {
+    key: &'static str,
+    label: &'static str,
+    hint: &'static str,
+    apply: bool,
+    value: String,
+}
+
+fn default_config_fields() -> [ConfigField; 5] {
+    let f = |key, label, hint| ConfigField {
+        key,
+        label,
+        hint,
+        apply: false,
+        value: String::new(),
+    };
+    [
+        f(
+            "emanagement_url",
+            "e-Management URL",
+            "http://docs.ansc.local:3080 — turns on the MoldSign bridge; empty = off",
+        ),
+        f(
+            "master_address",
+            "Master address",
+            "host:port to skip discovery; empty = auto-discover",
+        ),
+        f(
+            "discovery_targets",
+            "Discovery targets",
+            "extra broadcast addresses, comma-separated, e.g. 192.168.20.255:48621",
+        ),
+        f(
+            "telemetry_interval_secs",
+            "Telemetry interval (s)",
+            "seconds between telemetry reports, e.g. 30",
+        ),
+        f(
+            "moldsign_path",
+            "MoldSign path",
+            "override SignDesktop.exe location; empty = auto",
+        ),
+    ]
 }
 
 impl App {
@@ -89,6 +145,11 @@ impl App {
             package: None,
             package_error: String::new(),
             pending_update: None,
+            show_remote_cfg: false,
+            rc_scope_all: true,
+            rc: default_config_fields(),
+            rc_status: String::new(),
+            pending_install_all: None,
         };
         app.load_package();
         app
@@ -150,6 +211,21 @@ impl App {
             .collect()
     }
 
+    /// Online agents whose version is not newer than the package (so an update
+    /// or repair would not be a downgrade), and not already updating.
+    fn updatable_online(&self) -> Vec<String> {
+        let Some(p) = &self.package else {
+            return Vec::new();
+        };
+        let s = self.state.lock().unwrap();
+        s.agents
+            .values()
+            .filter(|a| a.online && a.update_command.is_none())
+            .filter(|a| agentpkg::update_state(&a.agent_version, &p.version) != UpdateState::Newer)
+            .map(|a| a.agent_id.clone())
+            .collect()
+    }
+
     fn update_agents(&mut self, ids: Vec<String>) {
         if let Some(p) = &self.package {
             agentpkg::start_update(
@@ -159,6 +235,141 @@ impl App {
                 &self.settings.emanagement_url,
                 Self::new_command_id,
             );
+        }
+    }
+
+    /// Agent ids of every online agent.
+    fn online_ids(&self) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        s.agents
+            .values()
+            .filter(|a| a.online)
+            .map(|a| a.agent_id.clone())
+            .collect()
+    }
+
+    /// Send a remote config change to each listed agent.
+    fn set_config_on(&self, ids: &[String], updates: Vec<ConfigUpdate>) {
+        if updates.is_empty() || ids.is_empty() {
+            return;
+        }
+        let keys: Vec<&str> = updates.iter().map(|u| u.key.as_str()).collect();
+        for id in ids {
+            self.send_to(
+                id,
+                MasterMsg::SetConfig {
+                    command_id: Self::new_command_id(),
+                    updates: updates.clone(),
+                },
+            );
+        }
+        if let Ok(mut s) = self.state.lock() {
+            s.log(format!(
+                "remote config ({}) sent to {} agent(s)",
+                keys.join(", "),
+                ids.len()
+            ));
+        }
+    }
+
+    /// Stream a local installer/file to each listed agent and run it. The file
+    /// is read once; each agent gets its own transfer, a few at a time.
+    fn push_file_to(&self, path: std::path::PathBuf, ids: Vec<String>) {
+        let args = split_args(&self.install_args);
+        let is_msi = self.install_is_msi
+            || path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("msi"));
+        let file_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "installer.exe".into());
+        let state = self.state.clone();
+        std::thread::spawn(move || {
+            let data = match std::fs::read(&path) {
+                Ok(d) => std::sync::Arc::new(d),
+                Err(e) => {
+                    if let Ok(mut s) = state.lock() {
+                        s.log(format!("cannot read {}: {e}", path.display()));
+                    }
+                    return;
+                }
+            };
+            let queue =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(ids)));
+            let mut workers = Vec::new();
+            for _ in 0..4 {
+                let (queue, state, data, file_name, args) = (
+                    queue.clone(),
+                    state.clone(),
+                    data.clone(),
+                    file_name.clone(),
+                    args.clone(),
+                );
+                workers.push(std::thread::spawn(move || loop {
+                    let Some(id) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
+                    let tx = {
+                        let s = state.lock().unwrap();
+                        s.agents.get(&id).and_then(|a| a.tx.clone())
+                    };
+                    let Some(tx) = tx else { continue };
+                    let run = RunSpec {
+                        command_id: App::new_command_id(),
+                        args: args.clone(),
+                        is_msi,
+                    };
+                    let transfer_id = App::new_command_id();
+                    let _ = tx.send(MasterMsg::FileBegin {
+                        transfer_id: transfer_id.clone(),
+                        file_name: file_name.clone(),
+                        total_len: data.len() as u64,
+                        run_after: Some(run),
+                    });
+                    for chunk in data.chunks(256 * 1024) {
+                        if tx
+                            .send(MasterMsg::FileChunk {
+                                transfer_id: transfer_id.clone(),
+                                data: chunk.to_vec(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    let _ = tx.send(MasterMsg::FileEnd { transfer_id });
+                }));
+            }
+            for w in workers {
+                let _ = w.join();
+            }
+            if let Ok(mut s) = state.lock() {
+                s.log(format!("installer {file_name} pushed to the fleet"));
+            }
+        });
+    }
+
+    fn install_url_on(&self, url: String, ids: &[String]) {
+        let is_msi = self.install_is_msi;
+        let args = split_args(&self.install_args);
+        for id in ids {
+            let run = RunSpec {
+                command_id: Self::new_command_id(),
+                args: args.clone(),
+                is_msi,
+            };
+            self.send_to(
+                id,
+                MasterMsg::InstallFromUrl {
+                    command_id: run.command_id.clone(),
+                    url: url.clone(),
+                    run,
+                },
+            );
+        }
+        if let Ok(mut s) = self.state.lock() {
+            s.log(format!("install-from-URL sent to {} agent(s)", ids.len()));
         }
     }
 
@@ -187,6 +398,12 @@ impl eframe::App for App {
         }
         if self.pending_update.is_some() {
             self.confirm_update_window(ctx);
+        }
+        if self.pending_install_all.is_some() {
+            self.confirm_install_all_window(ctx);
+        }
+        if self.show_remote_cfg {
+            self.remote_config_window(ctx);
         }
     }
 }
@@ -301,6 +518,7 @@ impl App {
         ui.heading("Fleet overview");
         ui.add_space(6.0);
         self.updates_panel(ui);
+        self.fleet_actions_panel(ui);
         ui.add_space(6.0);
         let rows: Vec<([String; 5], String)> = {
             let s = self.state.lock().unwrap();
@@ -422,8 +640,194 @@ impl App {
                 if btn.clicked() {
                     self.pending_update = Some(outdated.clone());
                 }
+                // Update / reinstall every online agent that isn't newer than
+                // the package (never a downgrade).
+                let all = self.updatable_online();
+                let m = all.len();
+                if ui
+                    .add_enabled(
+                        self.package.is_some() && m > 0,
+                        egui::Button::new(format!("⟳ Update/repair all {m} online")),
+                    )
+                    .on_hover_text("Push the package to every online PC (skips newer ones)")
+                    .clicked()
+                {
+                    self.pending_update = Some(all);
+                }
             });
         });
+    }
+
+    /// Fleet-wide actions: push an installer / URL to every online PC, and open
+    /// the remote-config editor. (Updates are in `updates_panel` above.)
+    fn fleet_actions_panel(&mut self, ui: &mut egui::Ui) {
+        let online = self.online_ids();
+        let n = online.len();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Fleet actions");
+                ui.separator();
+                ui.label(format!("{n} online"));
+                ui.separator();
+                if ui
+                    .add_enabled(n > 0, egui::Button::new("⬇ Install file on all…"))
+                    .clicked()
+                {
+                    if let Some(path) = rfd::FileDialog::new().pick_file() {
+                        self.pending_install_all = Some((path.display().to_string(), false));
+                    }
+                }
+                ui.checkbox(&mut self.install_is_msi, "MSI");
+                ui.label("args:");
+                ui.add(egui::TextEdit::singleline(&mut self.install_args).desired_width(90.0));
+                ui.separator();
+                ui.label("URL:");
+                ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(200.0));
+                let url_ok = self.url_input.trim().to_lowercase().starts_with("https://");
+                if ui
+                    .add_enabled(n > 0 && url_ok, egui::Button::new("⬇ URL on all…"))
+                    .on_disabled_hover_text("Enter an https:// URL")
+                    .clicked()
+                {
+                    self.pending_install_all = Some((self.url_input.trim().to_string(), true));
+                }
+                ui.separator();
+                if ui.button("⚙ Remote config…").clicked() {
+                    self.rc_status.clear();
+                    self.show_remote_cfg = true;
+                }
+            });
+        });
+    }
+
+    fn confirm_install_all_window(&mut self, ctx: &egui::Context) {
+        let Some((target, is_url)) = self.pending_install_all.clone() else {
+            return;
+        };
+        let ids = self.online_ids();
+        let mut decision: Option<bool> = None;
+        egui::Window::new("Install on all online PCs?")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Run this on {} online PC(s) as SYSTEM{}:",
+                    ids.len(),
+                    if self.install_is_msi { " (MSI)" } else { "" }
+                ));
+                ui.add_space(4.0);
+                ui.monospace(&target);
+                ui.label(format!("Silent args: {}", self.install_args));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(format!("Install on {} PC(s)", ids.len()))
+                        .clicked()
+                    {
+                        decision = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.pending_install_all = None;
+                if is_url {
+                    self.install_url_on(target, &ids);
+                } else {
+                    self.push_file_to(std::path::PathBuf::from(target), ids);
+                }
+            }
+            Some(false) => self.pending_install_all = None,
+            None => {}
+        }
+    }
+
+    fn remote_config_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_remote_cfg;
+        let selected = self.selected.clone();
+        egui::Window::new("Remote config")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Change agent config on running PCs. The agent applies only these keys \
+                     (never its master identity or enrollment secret) and restarts to pick them \
+                     up. An empty value clears the key.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.rc_scope_all, true, "All online PCs");
+                    let one = selected.is_some();
+                    ui.add_enabled_ui(one, |ui| {
+                        ui.radio_value(&mut self.rc_scope_all, false, "Selected PC only");
+                    });
+                    if !one {
+                        self.rc_scope_all = true;
+                    }
+                });
+                ui.separator();
+                egui::Grid::new("rc_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        for f in self.rc.iter_mut() {
+                            ui.checkbox(&mut f.apply, f.label);
+                            ui.add(
+                                egui::TextEdit::singleline(&mut f.value)
+                                    .desired_width(320.0)
+                                    .hint_text(f.hint),
+                            );
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                let updates: Vec<ConfigUpdate> = self
+                    .rc
+                    .iter()
+                    .filter(|f| f.apply)
+                    .map(|f| ConfigUpdate {
+                        key: f.key.to_string(),
+                        value: {
+                            let v = f.value.trim();
+                            if v.is_empty() {
+                                None
+                            } else {
+                                Some(v.to_string())
+                            }
+                        },
+                    })
+                    .collect();
+                let ids = if self.rc_scope_all {
+                    self.online_ids()
+                } else {
+                    selected.clone().into_iter().collect()
+                };
+                ui.horizontal(|ui| {
+                    let can = !updates.is_empty() && !ids.is_empty();
+                    if ui
+                        .add_enabled(
+                            can,
+                            egui::Button::new(format!("Apply to {} PC(s)", ids.len())),
+                        )
+                        .clicked()
+                    {
+                        let n = updates.len();
+                        self.set_config_on(&ids, updates);
+                        self.rc_status = format!(
+                            "Sent {n} key(s) to {} PC(s). Watch the Events log.",
+                            ids.len()
+                        );
+                    }
+                    if !self.rc_status.is_empty() {
+                        ui.label(&self.rc_status);
+                    }
+                });
+            });
+        self.show_remote_cfg = open;
     }
 
     fn confirm_update_window(&mut self, ctx: &egui::Context) {
