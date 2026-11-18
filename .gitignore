@@ -1,0 +1,16 @@
+/target
+/dist
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build/IDE
+.vs/
+.idea/
+*.user
+
+# Runtime / provisioning artifacts (never commit secrets)
+installer/agent.config.json
+*.pem
+*.key
+master.settings.json
+known_agents.json

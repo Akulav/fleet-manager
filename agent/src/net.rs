@@ -1,0 +1,339 @@
+//! Discovery + TLS control channel to the master.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc;
+use tokio_rustls::TlsConnector;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::sync::CancellationToken;
+
+use fleetview_shared::discovery::{DiscoveryBeacon, DiscoveryQuery};
+use fleetview_shared::protocol::{AgentMsg, Hello, MasterMsg};
+use fleetview_shared::{crypto, DISCOVERY_MAGIC, DISCOVERY_PORT, PROTOCOL_VERSION};
+
+use crate::config::AgentConfig;
+use crate::ipc::{Hub, HelperCommand, HelperEvent};
+
+/// Reconnect forever until shutdown.
+pub async fn connection_loop(cfg: AgentConfig, hub: Hub, shutdown: CancellationToken) {
+    let mut backoff = 2u64;
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+        match discover_master(&cfg, &shutdown).await {
+            Ok((addr, fingerprint)) => {
+                tracing::info!("master at {addr}");
+                match run_session(&cfg, addr, &fingerprint, &hub, &shutdown).await {
+                    Ok(()) => backoff = 2,
+                    Err(e) => tracing::warn!("session ended: {e:#}"),
+                }
+            }
+            Err(e) => tracing::info!("master not found yet: {e:#}"),
+        }
+        hub.set_connected(false, "").await;
+        // Wait before retrying, capped.
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+        }
+        backoff = (backoff * 2).min(30);
+    }
+}
+
+/// Find the master either via the configured fixed address or UDP discovery.
+async fn discover_master(
+    cfg: &AgentConfig,
+    shutdown: &CancellationToken,
+) -> Result<(SocketAddr, String)> {
+    if let Some(addr) = &cfg.master_address {
+        let sa = tokio::net::lookup_host(addr)
+            .await
+            .with_context(|| format!("resolve {addr}"))?
+            .next()
+            .with_context(|| format!("no address for {addr}"))?;
+        return Ok((sa, cfg.master_cert_fingerprint.clone()));
+    }
+
+    let sock = UdpSocket::bind(("0.0.0.0", 0)).await?;
+    sock.set_broadcast(true)?;
+
+    let query = DiscoveryQuery {
+        protocol: PROTOCOL_VERSION,
+        hostname: hostname(),
+    };
+    let mut datagram = DISCOVERY_MAGIC.to_vec();
+    datagram.push(0);
+    datagram.extend_from_slice(&rmp_serde::to_vec_named(&query)?);
+
+    // Broadcast to the global broadcast address plus any configured targets.
+    let mut targets: Vec<String> = vec![format!("255.255.255.255:{DISCOVERY_PORT}")];
+    targets.extend(cfg.discovery_targets.iter().cloned());
+    for t in &targets {
+        if let Ok(mut addrs) = tokio::net::lookup_host(t).await {
+            if let Some(a) = addrs.next() {
+                let _ = sock.send_to(&datagram, a).await;
+            }
+        }
+    }
+
+    // Await a valid, signed beacon for a few seconds.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if timeout.is_zero() {
+            anyhow::bail!("no beacon within timeout");
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => anyhow::bail!("shutting down"),
+            _ = tokio::time::sleep(timeout) => anyhow::bail!("no beacon within timeout"),
+            res = sock.recv_from(&mut buf) => {
+                let (n, src) = res?;
+                if let Some((addr, fp)) = parse_beacon(cfg, &buf[..n], src) {
+                    return Ok((addr, fp));
+                }
+            }
+        }
+    }
+}
+
+fn parse_beacon(cfg: &AgentConfig, data: &[u8], src: SocketAddr) -> Option<(SocketAddr, String)> {
+    let prefix_len = DISCOVERY_MAGIC.len() + 1;
+    if data.len() <= prefix_len || &data[..DISCOVERY_MAGIC.len()] != DISCOVERY_MAGIC {
+        return None;
+    }
+    let beacon: DiscoveryBeacon = rmp_serde::from_slice(&data[prefix_len..]).ok()?;
+    if beacon.protocol != PROTOCOL_VERSION {
+        return None;
+    }
+    // Verify the master's signature over the beacon.
+    if !crypto::verify_signature(
+        &cfg.master_public_key,
+        &beacon.canonical_bytes(),
+        &beacon.signature,
+    ) {
+        tracing::warn!("ignoring beacon from {src}: bad signature");
+        return None;
+    }
+    // Pinned cert fingerprint must match what we expect.
+    if !crypto::secrets_match(
+        &beacon.cert_fingerprint.to_lowercase(),
+        &cfg.master_cert_fingerprint.to_lowercase(),
+    ) {
+        tracing::warn!("ignoring beacon from {src}: cert fingerprint mismatch");
+        return None;
+    }
+    let addr = SocketAddr::new(src.ip(), beacon.control_port);
+    Some((addr, beacon.cert_fingerprint))
+}
+
+async fn run_session(
+    cfg: &AgentConfig,
+    addr: SocketAddr,
+    fingerprint: &str,
+    hub: &Hub,
+    shutdown: &CancellationToken,
+) -> Result<()> {
+    let tcp = TcpStream::connect(addr).await.context("tcp connect")?;
+    tcp.set_nodelay(true).ok();
+    let connector = TlsConnector::from(crate::tls::client_config(fingerprint));
+    let server_name = rustls::pki_types::ServerName::try_from("fleetview-master")
+        .context("server name")?;
+    let tls = connector.connect(server_name, tcp).await.context("tls handshake")?;
+
+    let mut framed = Framed::new(
+        tls,
+        LengthDelimitedCodec::builder()
+            .max_frame_length(fleetview_shared::MAX_FRAME_BYTES)
+            .new_codec(),
+    );
+
+    // Say hello and provide the enrollment secret.
+    let hello = AgentMsg::Hello(Hello {
+        protocol: PROTOCOL_VERSION,
+        agent_id: cfg.agent_id.clone(),
+        hostname: hostname(),
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        enrollment_secret: cfg.enrollment_secret.clone(),
+    });
+    framed.send(encode(&hello)?).await?;
+
+    // Expect an ack.
+    let ack = framed.next().await.context("no hello ack")??;
+    match rmp_serde::from_slice::<MasterMsg>(&ack)? {
+        MasterMsg::HelloAck { accepted: true, .. } => {}
+        MasterMsg::HelloAck { accepted: false, reason } => {
+            anyhow::bail!("master rejected enrollment: {reason}");
+        }
+        other => anyhow::bail!("unexpected first message: {other:?}"),
+    }
+
+    let master_name = hub.0.master_name.lock().await.clone();
+    hub.set_connected(true, if master_name.is_empty() { "master" } else { &master_name }).await;
+    tracing::info!("connected and enrolled with master");
+
+    // Outbound queue so background tasks (command results, telemetry) don't block
+    // the read side.
+    let (tx_out, mut rx_out) = mpsc::channel::<AgentMsg>(256);
+
+    // Helper events (screen frames / logs) → master.
+    let mut helper_rx = hub.subscribe_events();
+
+    let mut telemetry_tick =
+        tokio::time::interval(Duration::from_secs(cfg.telemetry_interval_secs.max(5)));
+    let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(20));
+
+    // Send an immediate telemetry snapshot.
+    spawn_telemetry(hub.clone(), tx_out.clone());
+
+    // In-flight file transfers.
+    let mut transfers: std::collections::HashMap<String, crate::commands::FileTransfer> =
+        std::collections::HashMap::new();
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+
+            Some(msg) = rx_out.recv() => {
+                framed.send(encode(&msg)?).await?;
+            }
+
+            _ = telemetry_tick.tick() => {
+                spawn_telemetry(hub.clone(), tx_out.clone());
+            }
+
+            _ = heartbeat_tick.tick() => {
+                framed.send(encode(&AgentMsg::Heartbeat)?).await?;
+            }
+
+            evt = helper_rx.recv() => {
+                match evt {
+                    Ok(HelperEvent::ScreenFrame { command_id, width, height, jpeg }) => {
+                        let msg = AgentMsg::ScreenFrame {
+                            command_id, width, height, jpeg: jpeg.into_vec(),
+                        };
+                        framed.send(encode(&msg)?).await?;
+                    }
+                    Ok(HelperEvent::Log { level, message }) => {
+                        framed.send(encode(&AgentMsg::Log { level, message })?).await?;
+                    }
+                    Ok(HelperEvent::Hello { .. }) => { /* tracked in hub */ }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => {}
+                }
+            }
+
+            incoming = framed.next() => {
+                let Some(frame) = incoming else { break };
+                let frame = frame?;
+                let msg: MasterMsg = rmp_serde::from_slice(&frame)?;
+                handle_master_msg(msg, cfg, hub, &tx_out, &mut transfers).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_master_msg(
+    msg: MasterMsg,
+    cfg: &AgentConfig,
+    hub: &Hub,
+    tx_out: &mpsc::Sender<AgentMsg>,
+    transfers: &mut std::collections::HashMap<String, crate::commands::FileTransfer>,
+) {
+    match msg {
+        MasterMsg::HelloAck { .. } => {}
+        MasterMsg::Ping => {
+            let _ = tx_out.send(AgentMsg::Heartbeat).await;
+        }
+        MasterMsg::RequestTelemetry => spawn_telemetry(hub.clone(), tx_out.clone()),
+        MasterMsg::RequestSoftware => {
+            let tx = tx_out.clone();
+            tokio::task::spawn_blocking(move || {
+                let list = crate::inventory::installed_software();
+                let _ = tx.blocking_send(AgentMsg::Software(list));
+            });
+        }
+        MasterMsg::RunPowerShell { command_id, script } => {
+            let tx = tx_out.clone();
+            tokio::spawn(async move {
+                let result = crate::commands::run_powershell(command_id, script).await;
+                let _ = tx.send(AgentMsg::CommandResult(result)).await;
+            });
+        }
+        MasterMsg::FileBegin { transfer_id, file_name, total_len, run_after } => {
+            match crate::commands::FileTransfer::begin(&transfer_id, &file_name, total_len, run_after) {
+                Ok(t) => { transfers.insert(transfer_id, t); }
+                Err(e) => tracing::warn!("file begin failed: {e:#}"),
+            }
+        }
+        MasterMsg::FileChunk { transfer_id, data } => {
+            if let Some(t) = transfers.get_mut(&transfer_id) {
+                if let Err(e) = t.write(&data) {
+                    tracing::warn!("file chunk failed: {e:#}");
+                } else {
+                    let _ = tx_out
+                        .send(AgentMsg::FileAck { transfer_id, received: t.received() })
+                        .await;
+                }
+            }
+        }
+        MasterMsg::FileEnd { transfer_id } => {
+            if let Some(t) = transfers.remove(&transfer_id) {
+                let tx = tx_out.clone();
+                tokio::spawn(async move {
+                    if let Some(result) = t.finish().await {
+                        let _ = tx.send(AgentMsg::CommandResult(result)).await;
+                    }
+                });
+            }
+        }
+        MasterMsg::InstallFromUrl { command_id, url, run } => {
+            let tx = tx_out.clone();
+            tokio::spawn(async move {
+                let result = crate::commands::install_from_url(command_id, url, run).await;
+                let _ = tx.send(AgentMsg::CommandResult(result)).await;
+            });
+        }
+        MasterMsg::RequestScreenshot { command_id } => {
+            hub.send_to_helper(HelperCommand::CaptureOnce { command_id });
+        }
+        MasterMsg::StartScreenStream { interval_ms, jpeg_quality } => {
+            hub.send_to_helper(HelperCommand::StartStream { interval_ms, jpeg_quality });
+        }
+        MasterMsg::StopScreenStream => hub.send_to_helper(HelperCommand::StopStream),
+        MasterMsg::NotifyUser { title, body } => {
+            hub.send_to_helper(HelperCommand::Notify { title, body });
+        }
+    }
+    let _ = cfg; // reserved for future per-command policy checks
+}
+
+fn spawn_telemetry(hub: Hub, tx: mpsc::Sender<AgentMsg>) {
+    tokio::spawn(async move {
+        let user = hub.0.user.lock().await.clone();
+        let t = tokio::task::spawn_blocking(move || crate::telemetry::gather(user))
+            .await
+            .ok();
+        if let Some(t) = t {
+            let _ = tx.send(AgentMsg::Telemetry(t)).await;
+        }
+    });
+}
+
+fn encode(msg: &AgentMsg) -> Result<bytes::Bytes> {
+    Ok(rmp_serde::to_vec_named(msg)?.into())
+}
+
+fn hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .or_else(|| sysinfo::System::host_name())
+        .unwrap_or_else(|| "unknown".into())
+}
