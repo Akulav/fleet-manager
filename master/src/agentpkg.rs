@@ -10,7 +10,7 @@ use anyhow::Context;
 use fleetview_shared::package::{self, Version};
 use fleetview_shared::protocol::{MasterMsg, RunSpec};
 
-use crate::state::SharedState;
+use crate::state::{SharedState, TargetStatus};
 
 /// Agent exe loaded into memory (config trailer, if any, already stripped).
 pub struct AgentPackage {
@@ -88,6 +88,7 @@ pub fn start_update(
     ids: Vec<String>,
     emanagement_url: &str,
     new_id: fn() -> String,
+    job: Option<u64>,
 ) {
     let mut args = vec!["update".to_string()];
     let url = emanagement_url.trim();
@@ -107,7 +108,7 @@ pub fn start_update(
             let Some(id) = queue.lock().unwrap().pop_front() else {
                 break;
             };
-            push_one(&state, &id, &image, version, &args, new_id);
+            push_one(&state, &id, &image, version, &args, new_id, job);
         });
     }
     if let Ok(mut s) = state.lock() {
@@ -220,6 +221,20 @@ fn set_note(state: &SharedState, id: &str, note: String) {
     }
 }
 
+/// Note a failed update on the agent and its job target.
+fn fail(state: &SharedState, id: &str, job: Option<u64>, status: TargetStatus, note: &str) {
+    let mut s = state.lock().unwrap();
+    if let Some(a) = s.agents.get_mut(id) {
+        a.update_note = Some(note.to_string());
+        if status == TargetStatus::Failed {
+            a.update_command = None;
+        }
+    }
+    if let Some(j) = job {
+        s.finish_target(j, id, status, note);
+    }
+}
+
 fn push_one(
     state: &SharedState,
     id: &str,
@@ -227,23 +242,38 @@ fn push_one(
     version: Version,
     args: &[String],
     new_id: fn() -> String,
+    job: Option<u64>,
 ) {
     let command_id = new_id();
     let transfer_id = new_id();
-    let tx = {
+    let online = {
         let mut s = state.lock().unwrap();
-        let Some(a) = s.agents.get_mut(id) else {
-            return;
+        let online = match s.agents.get_mut(id) {
+            None => return,
+            Some(a) if a.tx.is_none() => false,
+            Some(a) => {
+                a.update_note = Some(format!("sending {version}…"));
+                a.update_command = Some(command_id.clone());
+                true
+            }
         };
-        let Some(tx) = a.tx.clone() else {
-            a.update_note = Some("offline — not updated".into());
-            return;
-        };
-        a.update_note = Some(format!("sending {version}…"));
-        a.update_command = Some(command_id.clone());
-        tx
+        if online {
+            if let Some(j) = job {
+                s.attach_command(j, id, &command_id);
+            }
+        }
+        online
     };
-    drop(tx);
+    if !online {
+        fail(
+            state,
+            id,
+            job,
+            TargetStatus::Skipped,
+            "offline — not updated",
+        );
+        return;
+    }
     let sent = send_file_and_wait(
         state,
         id,
@@ -259,14 +289,22 @@ fn push_one(
     match sent {
         SendOutcome::Delivered => {}
         SendOutcome::Offline => {
-            set_note(state, id, "connection lost while sending".into());
+            fail(
+                state,
+                id,
+                job,
+                TargetStatus::Failed,
+                "connection lost while sending",
+            );
             return;
         }
         SendOutcome::TimedOut => {
-            set_note(
+            fail(
                 state,
                 id,
-                "no confirmation from the agent (timed out)".into(),
+                job,
+                TargetStatus::Failed,
+                "no confirmation from the agent (timed out)",
             );
             return;
         }

@@ -269,6 +269,7 @@ where
             }
         }
         if went_offline {
+            s.fail_pending_for(&agent_id);
             s.log(format!("{} ({agent_id}) went offline", hello.hostname));
             save_known(&s);
         }
@@ -311,9 +312,12 @@ where
     Ok(())
 }
 
-fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
+pub(crate) fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
     let mut s = state.lock().unwrap();
     let now = Local::now();
+    if let AgentMsg::CommandResult(r) = &msg {
+        s.complete_command(r);
+    }
     let Some(a) = s.agents.get_mut(agent_id) else {
         return;
     };
@@ -321,9 +325,7 @@ fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
     match msg {
         AgentMsg::Hello(_) => {}
         AgentMsg::Telemetry(t) => {
-            a.hostname = t.hostname.clone();
-            a.agent_version = t.agent_version.clone();
-            a.telemetry = Some(t);
+            a.apply_telemetry(t, now);
         }
         AgentMsg::Software(list) => {
             a.software = list;
@@ -364,6 +366,7 @@ fn apply_agent_msg(msg: AgentMsg, agent_id: &str, state: &SharedState) {
                 jpeg,
             });
             a.frame_seq = a.frame_seq.wrapping_add(1);
+            a.frame_at = Some(now);
         }
         // One ack per 256 KiB chunk — far too many for the event list.
         AgentMsg::FileAck {

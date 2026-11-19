@@ -57,6 +57,32 @@ the LAN even when IP addresses change.
 - **Localized** — the master app is **English**; the agent tray/splash default to
   **Romanian**.
 
+### Master app
+
+- **Dashboard** — online/known PCs, PCs needing attention, outdated agents and
+  running jobs at a glance, plus fleet CPU/memory/disk averages, the busiest PCs,
+  OS breakdown, recent jobs and activity.
+- **Devices table** — search (Ctrl+F), status chips (online, offline, needs
+  attention, outdated), tag filter, sortable columns with CPU/memory/disk meters,
+  and CSV export.
+- **Bulk actions** — tick any set of PCs and run a script, install, message
+  users, update the agent, restart/shut down (with a 1-minute warning, and
+  cancel), Wake-on-LAN, tag, push remote config, or remove offline PCs. Risky
+  actions always show a confirmation listing every target.
+- **Jobs** — every action becomes a job with a per-PC result (succeeded,
+  failed + exit code, skipped, running) and its output; re-run the failures.
+- **Alerts** — disk, memory, sustained CPU, long-offline and failed-update
+  alerts with adjustable thresholds.
+- **Device page** — live CPU/memory charts, disks, system facts (click to copy),
+  tags and notes, software with uninstall, a PowerShell console with a snippet
+  library, saved snippets and history (Ctrl+Enter / Ctrl+↑↓), screen capture with
+  fit/actual size and save-as-PNG, and the PC's job history.
+- **Fleet software** — every program across the fleet, how many PCs have it,
+  which versions, where it is missing, and uninstall from all of them.
+- **Dark and light themes.**
+- **Demo mode** — `fleetview-master.exe --demo` opens a simulated fleet (no
+  network, separate data folder) to try the app without agents.
+
 ## Repository layout
 
 | Path | What it is |

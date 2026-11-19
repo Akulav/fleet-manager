@@ -4,16 +4,24 @@
 
 mod agentpkg;
 mod app;
+mod demo;
 mod paths;
+mod prefs;
 mod server;
 mod settings;
 mod state;
+mod ui;
+mod wol;
 
 use std::sync::{Arc, Mutex};
 
 use state::{Shared, SharedState};
 
 fn main() -> eframe::Result<()> {
+    let demo = demo::requested();
+    if demo {
+        demo::use_demo_data_dir();
+    }
     init_logging();
 
     let settings = match settings::MasterSettings::load_or_create() {
@@ -30,28 +38,41 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    // Seed shared state with every agent we have ever seen (as offline).
-    let shared = Shared::new(settings.master_name.clone());
+    let master_name = if demo {
+        "FleetView demo".to_string()
+    } else {
+        settings.master_name.clone()
+    };
+    let shared = Shared::new(master_name);
     let state: SharedState = Arc::new(Mutex::new(shared));
-    {
-        let mut s = state.lock().unwrap();
-        for known in state::load_known() {
-            s.agents.insert(
-                known.agent_id.clone(),
-                state::AgentView::offline_from(&known),
-            );
-        }
-        s.log("master started");
-    }
 
-    // Start the networking backend.
-    server::spawn_backend(settings.clone(), state.clone());
+    if demo {
+        demo::start(state.clone());
+    } else {
+        // Seed shared state with every agent we have ever seen (as offline).
+        {
+            let mut s = state.lock().unwrap();
+            for known in state::load_known() {
+                s.agents.insert(
+                    known.agent_id.clone(),
+                    state::AgentView::offline_from(&known),
+                );
+            }
+            s.log("master started");
+        }
+        // Start the networking backend.
+        server::spawn_backend(settings.clone(), state.clone());
+    }
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 740.0])
-            .with_min_inner_size([820.0, 560.0])
-            .with_title("FleetView — Master"),
+            .with_inner_size([1360.0, 860.0])
+            .with_min_inner_size([980.0, 620.0])
+            .with_title(if demo {
+                "FleetView — Master (demo)"
+            } else {
+                "FleetView — Master"
+            }),
         ..Default::default()
     };
 

@@ -1,75 +1,291 @@
 //! egui desktop UI for the master. English only (per requirement).
+//!
+//! Layout: a navigation sidebar (pages + quick device list), a page area, a
+//! status bar, modal dialogs and toasts. Every action sent to PCs becomes a
+//! [`crate::state::Job`] so its per-PC results can be followed in the Jobs page.
 
-use std::collections::HashMap;
+mod activity;
+mod dashboard;
+mod deploy;
+mod device;
+mod devices;
+mod dialogs;
+mod jobs;
+mod software;
 
-use eframe::egui;
+use std::collections::{BTreeSet, HashMap};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Local};
+use eframe::egui::{self, vec2, Color32, RichText};
 
 use fleetview_shared::protocol::{ConfigUpdate, MasterMsg, RunSpec};
 
 use crate::agentpkg::{self, AgentPackage, UpdateState};
+use crate::prefs::Prefs;
 use crate::settings::MasterSettings;
-use crate::state::SharedState;
+use crate::state::{JobKind, SharedState, TargetStatus};
+use crate::ui::theme::{self, semibold, tint, Palette};
+use crate::ui::widgets as w;
 
-const GREEN: egui::Color32 = egui::Color32::from_rgb(40, 180, 120);
-const AMBER: egui::Color32 = egui::Color32::from_rgb(220, 160, 40);
+#[derive(Clone, PartialEq, Eq)]
+pub enum Page {
+    Dashboard,
+    Devices,
+    Software,
+    Jobs,
+    Activity,
+    Deploy,
+    Device(String),
+}
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Tab {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeviceTab {
     Overview,
     Software,
-    PowerShell,
+    Terminal,
     Screen,
+    History,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StatusFilter {
+    All,
+    Online,
+    Offline,
+    Attention,
+    Outdated,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SortKey {
+    Host,
+    User,
+    Cpu,
+    Mem,
+    Disk,
+    Uptime,
+    LastSeen,
+    Version,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowerKind {
+    Restart,
+    Shutdown,
+    Abort,
+}
+
+impl PowerKind {
+    fn label(self) -> &'static str {
+        match self {
+            PowerKind::Restart => "Restart",
+            PowerKind::Shutdown => "Shut down",
+            PowerKind::Abort => "Cancel pending restart/shutdown",
+        }
+    }
+
+    /// Restart/shutdown give the user 60 s and a visible reason; an admin can
+    /// still cancel with `Abort`.
+    fn script(self) -> String {
+        match self {
+            PowerKind::Restart => {
+                "shutdown.exe /r /t 60 /c \"This PC will restart in 1 minute (requested by IT). Please save your work.\"; exit $LASTEXITCODE".into()
+            }
+            PowerKind::Shutdown => {
+                "shutdown.exe /s /t 60 /c \"This PC will shut down in 1 minute (requested by IT). Please save your work.\"; exit $LASTEXITCODE".into()
+            }
+            PowerKind::Abort => "shutdown.exe /a; exit $LASTEXITCODE".into(),
+        }
+    }
+}
+
+/// An action that needs an explicit confirmation before it is sent.
+#[derive(Clone)]
+pub enum Action {
+    RunScript {
+        script: String,
+        ids: Vec<String>,
+    },
+    InstallFile {
+        path: String,
+        ids: Vec<String>,
+    },
+    InstallUrl {
+        url: String,
+        ids: Vec<String>,
+    },
+    Update {
+        ids: Vec<String>,
+    },
+    Power {
+        kind: PowerKind,
+        ids: Vec<String>,
+    },
+    Uninstall {
+        name: String,
+        targets: Vec<(String, String)>,
+    },
+    SetConfig {
+        ids: Vec<String>,
+        updates: Vec<ConfigUpdate>,
+    },
+    Notify {
+        title: String,
+        body: String,
+        ids: Vec<String>,
+    },
+    Forget {
+        ids: Vec<String>,
+    },
+}
+
+impl Action {
+    fn ids(&self) -> Vec<String> {
+        match self {
+            Action::RunScript { ids, .. }
+            | Action::InstallFile { ids, .. }
+            | Action::InstallUrl { ids, .. }
+            | Action::Update { ids }
+            | Action::Power { ids, .. }
+            | Action::SetConfig { ids, .. }
+            | Action::Notify { ids, .. }
+            | Action::Forget { ids } => ids.clone(),
+            Action::Uninstall { targets, .. } => targets.iter().map(|t| t.0.clone()).collect(),
+        }
+    }
+}
+
+/// Bulk-action editors opened from the selection bar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ComposerKind {
+    Script,
+    Install,
+    Notify,
+    Config,
+    Tags,
+}
+
+pub struct Composer {
+    pub kind: ComposerKind,
+    pub ids: Vec<String>,
+}
+
+pub struct Toast {
+    text: String,
+    color: Color32,
+    until: Instant,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Severity {
+    Info,
+    Warn,
+    Crit,
+}
+
+#[derive(Clone)]
+pub struct Alert {
+    pub severity: Severity,
+    pub text: String,
+}
+
+/// One frame's view of an agent, read under a single lock.
+#[derive(Clone)]
+pub struct DeviceRow {
+    pub id: String,
+    pub host: String,
+    pub online: bool,
+    pub user: String,
+    pub ips: Vec<String>,
+    pub os: String,
+    pub cpu: Option<f32>,
+    pub mem: Option<f32>,
+    pub disk: Option<(String, f32)>,
+    pub uptime: Option<u64>,
+    pub last_seen: DateTime<Local>,
+    pub version: String,
+    pub update: UpdateState,
+    pub update_note: Option<String>,
+    pub updating: bool,
+    pub streaming: bool,
+    pub tags: Vec<String>,
+    pub alerts: Vec<Alert>,
+    pub cpu_hist: Vec<f32>,
+}
+
+impl DeviceRow {
+    pub fn worst(&self) -> Option<Severity> {
+        self.alerts.iter().map(|a| a.severity).max()
+    }
 }
 
 pub struct App {
     state: SharedState,
     settings: MasterSettings,
-    selected: Option<String>, // None => fleet overview
-    tab: Tab,
+    prefs: Prefs,
+    pal: Palette,
+    page: Page,
+    /// Pages visited before the current one (for Back).
+    back: Vec<Page>,
+    device_tab: DeviceTab,
 
     // per-agent screen textures: agent_id -> (frame_seq, texture)
     textures: HashMap<String, (u64, egui::TextureHandle)>,
+    screen_fit: bool,
 
-    // input fields
+    // Device list
+    checked: BTreeSet<String>,
+    search: String,
+    sidebar_search: String,
+    status_filter: StatusFilter,
+    tag_filter: Option<String>,
+    sort: (SortKey, bool),
+    focus_search: bool,
+
+    // Terminal
     ps_input: String,
-    ps_run_all: bool,
+    ps_history: Vec<String>,
+    ps_history_pos: Option<usize>,
+    snippet_name: String,
+
+    // Inputs shared by dialogs
     notify_title: String,
     notify_body: String,
     software_filter: String,
+    fleet_sw_filter: String,
+    fleet_sw_open: Option<String>,
     install_args: String,
     install_is_msi: bool,
     url_input: String,
+    install_path: String,
     stream_fps: u32,
+    tag_input: String,
+    activity_filter: String,
+    selected_job: Option<u64>,
+    job_filter_failed: bool,
 
-    // "Run on ALL" awaiting confirmation: (script, target agent ids)
-    pending_run_all: Option<(String, Vec<String>)>,
-
-    // agent-config export window
-    show_config: bool,
+    // Deploy page
     config_text: String,
     config_master_addr: String,
     emanagement_input: String,
     config_status: String,
+    rc: [ConfigField; 5],
 
     // agent package used for setups and remote updates
     package: Option<AgentPackage>,
     package_error: String,
-    // "Update agents" awaiting confirmation: target agent ids
-    pending_update: Option<Vec<String>>,
 
-    // Remote config editor
-    show_remote_cfg: bool,
-    rc_scope_all: bool,
-    rc: [ConfigField; 5],
-    rc_status: String,
-    // "Install on ALL online" awaiting confirmation: (file path or URL, is_url)
-    pending_install_all: Option<(String, bool)>,
+    // dialogs
+    confirm: Option<Action>,
+    composer: Option<Composer>,
+    toasts: Vec<Toast>,
 }
 
 /// One row in the remote-config editor: a key, whether to apply it, and its
 /// value. The key names match the agent's `REMOTE_SETTABLE_KEYS`.
 #[derive(Clone)]
-struct ConfigField {
+pub struct ConfigField {
     key: &'static str,
     label: &'static str,
     hint: &'static str,
@@ -116,44 +332,153 @@ fn default_config_fields() -> [ConfigField; 5] {
 
 impl App {
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         state: SharedState,
         settings: MasterSettings,
     ) -> Self {
+        let prefs = Prefs::load();
+        let pal = Palette::new(prefs.dark);
+        theme::install_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx, &pal);
         let emanagement_input = settings.emanagement_url.clone();
+        let config_text = settings
+            .agent_config_json(None)
+            .unwrap_or_else(|e| format!("error: {e}"));
         let mut app = Self {
             state,
             settings,
-            selected: None,
-            tab: Tab::Overview,
+            prefs,
+            pal,
+            page: Page::Dashboard,
+            back: Vec::new(),
+            device_tab: DeviceTab::Overview,
             textures: HashMap::new(),
+            screen_fit: true,
+            checked: BTreeSet::new(),
+            search: String::new(),
+            sidebar_search: String::new(),
+            status_filter: StatusFilter::All,
+            tag_filter: None,
+            sort: (SortKey::Host, true),
+            focus_search: false,
             ps_input: String::new(),
-            ps_run_all: false,
+            ps_history: Vec::new(),
+            ps_history_pos: None,
+            snippet_name: String::new(),
             notify_title: "Message from IT".into(),
             notify_body: String::new(),
             software_filter: String::new(),
+            fleet_sw_filter: String::new(),
+            fleet_sw_open: None,
             install_args: "/S".into(),
             install_is_msi: false,
             url_input: String::new(),
+            install_path: String::new(),
             stream_fps: 2,
-            pending_run_all: None,
-            show_config: false,
-            config_text: String::new(),
+            tag_input: String::new(),
+            activity_filter: String::new(),
+            selected_job: None,
+            job_filter_failed: false,
+            config_text,
             config_master_addr: String::new(),
             emanagement_input,
             config_status: String::new(),
+            rc: default_config_fields(),
             package: None,
             package_error: String::new(),
-            pending_update: None,
-            show_remote_cfg: false,
-            rc_scope_all: true,
-            rc: default_config_fields(),
-            rc_status: String::new(),
-            pending_install_all: None,
+            confirm: None,
+            composer: None,
+            toasts: Vec::new(),
         };
         app.load_package();
+        // Demo mode can open on a given page (used for screenshots).
+        if crate::demo::requested() {
+            if let Ok(p) = std::env::var("FLEETVIEW_DEMO_PAGE") {
+                let (page, tab) = p.split_once(':').unwrap_or((p.as_str(), ""));
+                app.page = match page {
+                    "devices" => Page::Devices,
+                    "software" => {
+                        app.fleet_sw_open = Some("google chrome".into());
+                        Page::Software
+                    }
+                    "jobs" => Page::Jobs,
+                    "activity" => Page::Activity,
+                    "deploy" => Page::Deploy,
+                    "device" => Page::Device("demo-01".into()),
+                    _ => Page::Dashboard,
+                };
+                app.device_tab = match tab {
+                    "software" => DeviceTab::Software,
+                    "terminal" => DeviceTab::Terminal,
+                    "screen" => DeviceTab::Screen,
+                    "history" => DeviceTab::History,
+                    _ => DeviceTab::Overview,
+                };
+                if page == "devices" {
+                    app.checked.insert("demo-00".into());
+                    app.checked.insert("demo-01".into());
+                }
+            }
+            if std::env::var_os("FLEETVIEW_DEMO_LIGHT").is_some() {
+                app.set_dark(&cc.egui_ctx, false);
+            }
+        }
         app
     }
+
+    // -----------------------------------------------------------------------
+    // Navigation & feedback
+    // -----------------------------------------------------------------------
+
+    fn go(&mut self, page: Page) {
+        if self.page != page {
+            let prev = std::mem::replace(&mut self.page, page);
+            self.back.push(prev);
+            if self.back.len() > 50 {
+                self.back.remove(0);
+            }
+        }
+    }
+
+    fn open_device(&mut self, id: &str) {
+        self.go(Page::Device(id.to_string()));
+    }
+
+    fn go_back(&mut self) {
+        if let Some(p) = self.back.pop() {
+            self.page = p;
+        }
+    }
+
+    fn toast(&mut self, text: impl Into<String>) {
+        self.toast_colored(text, self.pal.accent);
+    }
+
+    fn toast_err(&mut self, text: impl Into<String>) {
+        self.toast_colored(text, self.pal.red);
+    }
+
+    fn toast_colored(&mut self, text: impl Into<String>, color: Color32) {
+        self.toasts.push(Toast {
+            text: text.into(),
+            color,
+            until: Instant::now() + Duration::from_secs(4),
+        });
+        if self.toasts.len() > 5 {
+            self.toasts.remove(0);
+        }
+    }
+
+    fn set_dark(&mut self, ctx: &egui::Context, dark: bool) {
+        self.prefs.dark = dark;
+        self.pal = Palette::new(dark);
+        theme::apply(ctx, &self.pal);
+        self.prefs.save();
+    }
+
+    // -----------------------------------------------------------------------
+    // Package
+    // -----------------------------------------------------------------------
 
     /// (Re)load the agent package from the configured path or the default.
     fn load_package(&mut self) {
@@ -184,6 +509,13 @@ impl App {
         self.settings.agent_package_path = path.display().to_string();
         let _ = self.settings.save();
         self.load_package();
+        match &self.package {
+            Some(p) => {
+                let msg = format!("Loaded agent package {}", p.version);
+                self.toast(msg);
+            }
+            None => self.toast_err("That file is not a FleetView agent"),
+        }
     }
 
     fn update_state_of(&self, agent_version: &str) -> UpdateState {
@@ -193,52 +525,128 @@ impl App {
         }
     }
 
-    /// Online agents older than the package.
-    fn outdated_online(&self) -> Vec<String> {
-        let Some(p) = &self.package else {
-            return Vec::new();
-        };
+    // -----------------------------------------------------------------------
+    // Snapshot
+    // -----------------------------------------------------------------------
+
+    /// Read every agent once for this frame, with its alerts.
+    fn snapshot(&self) -> Vec<DeviceRow> {
         let s = self.state.lock().unwrap();
+        let now = Local::now();
         s.agents
             .values()
-            .filter(|a| a.online && a.update_command.is_none())
-            .filter(|a| {
-                // 0.1.x agents report a version too, so "Unknown" here means
-                // no Hello yet: skip until they say who they are.
-                agentpkg::update_state(&a.agent_version, &p.version) == UpdateState::Outdated
+            .map(|a| {
+                let t = a.telemetry.as_ref();
+                let cpu = t.filter(|_| a.online).map(|t| t.cpu_usage_pct);
+                let mem = a.mem_pct().filter(|_| a.online);
+                let disk = a.worst_disk();
+                let update = self.update_state_of(&a.agent_version);
+                let mut alerts = Vec::new();
+                if let Some((mount, pct)) = &disk {
+                    if *pct >= self.prefs.disk_warn_pct {
+                        alerts.push(Alert {
+                            severity: if *pct >= 97.0 {
+                                Severity::Crit
+                            } else {
+                                Severity::Warn
+                            },
+                            text: format!("Disk {mount} {pct:.0}% full"),
+                        });
+                    }
+                }
+                if let Some(m) = mem {
+                    if m >= self.prefs.mem_warn_pct {
+                        alerts.push(Alert {
+                            severity: Severity::Warn,
+                            text: format!("Memory at {m:.0}%"),
+                        });
+                    }
+                }
+                if let Some(c) = cpu {
+                    // Sustained: the last three samples all high.
+                    let recent: Vec<f32> = a.history.iter().rev().take(3).map(|s| s.cpu).collect();
+                    if c >= self.prefs.cpu_warn_pct
+                        && recent.len() == 3
+                        && recent.iter().all(|v| *v >= self.prefs.cpu_warn_pct)
+                    {
+                        alerts.push(Alert {
+                            severity: Severity::Warn,
+                            text: format!("CPU sustained at {c:.0}%"),
+                        });
+                    }
+                }
+                if !a.online && self.prefs.stale_days > 0 {
+                    let days = (now - a.last_seen).num_days();
+                    if days >= self.prefs.stale_days as i64 {
+                        alerts.push(Alert {
+                            severity: Severity::Info,
+                            text: format!("Offline for {days} days"),
+                        });
+                    }
+                }
+                if a.online && update == UpdateState::Outdated {
+                    alerts.push(Alert {
+                        severity: Severity::Info,
+                        text: format!("Agent {} is outdated", a.agent_version),
+                    });
+                }
+                if let Some(n) = &a.update_note {
+                    if n.contains("failed") || n.contains("not applied") {
+                        alerts.push(Alert {
+                            severity: Severity::Warn,
+                            text: format!("Agent update: {n}"),
+                        });
+                    }
+                }
+                DeviceRow {
+                    id: a.agent_id.clone(),
+                    host: a.hostname.clone(),
+                    online: a.online,
+                    user: a.last_user.clone().unwrap_or_default(),
+                    ips: a.last_ips.clone(),
+                    os: short_os(&a.last_os),
+                    cpu,
+                    mem,
+                    disk,
+                    uptime: t.filter(|_| a.online).map(|t| t.uptime_secs),
+                    last_seen: a.last_seen,
+                    version: a.agent_version.clone(),
+                    update,
+                    update_note: a.update_note.clone(),
+                    updating: a.update_command.is_some(),
+                    streaming: a.streaming,
+                    tags: a.tags.clone(),
+                    alerts,
+                    cpu_hist: a.history.iter().map(|s| s.cpu).collect(),
+                }
             })
-            .map(|a| a.agent_id.clone())
             .collect()
     }
 
-    /// Online agents whose version is not newer than the package (so an update
-    /// or repair would not be a downgrade), and not already updating.
-    fn updatable_online(&self) -> Vec<String> {
-        let Some(p) = &self.package else {
-            return Vec::new();
-        };
+    fn all_tags(rows: &[DeviceRow]) -> Vec<String> {
+        let mut t: Vec<String> = rows.iter().flat_map(|r| r.tags.clone()).collect();
+        t.sort_by_key(|s| s.to_lowercase());
+        t.dedup();
+        t
+    }
+
+    // -----------------------------------------------------------------------
+    // Sending
+    // -----------------------------------------------------------------------
+
+    /// Unique id per command. A bare millisecond timestamp collided when one
+    /// click sent several messages (e.g. "Run on ALL", or a file push).
+    pub fn new_command_id() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{}-{n}", chrono::Local::now().timestamp_millis())
+    }
+
+    fn send_to(&self, id: &str, msg: MasterMsg) -> bool {
         let s = self.state.lock().unwrap();
-        s.agents
-            .values()
-            .filter(|a| a.online && a.update_command.is_none())
-            .filter(|a| agentpkg::update_state(&a.agent_version, &p.version) != UpdateState::Newer)
-            .map(|a| a.agent_id.clone())
-            .collect()
+        s.agents.get(id).is_some_and(|a| a.send(msg))
     }
 
-    fn update_agents(&mut self, ids: Vec<String>) {
-        if let Some(p) = &self.package {
-            agentpkg::start_update(
-                self.state.clone(),
-                p,
-                ids,
-                &self.settings.emanagement_url,
-                Self::new_command_id,
-            );
-        }
-    }
-
-    /// Agent ids of every online agent.
     fn online_ids(&self) -> Vec<String> {
         let s = self.state.lock().unwrap();
         s.agents
@@ -248,33 +656,82 @@ impl App {
             .collect()
     }
 
-    /// Send a remote config change to each listed agent.
-    fn set_config_on(&self, ids: &[String], updates: Vec<ConfigUpdate>) {
-        if updates.is_empty() || ids.is_empty() {
-            return;
-        }
-        let keys: Vec<&str> = updates.iter().map(|u| u.key.as_str()).collect();
+    /// Of `ids`, the online ones.
+    fn only_online(&self, ids: &[String]) -> Vec<String> {
+        let s = self.state.lock().unwrap();
+        ids.iter()
+            .filter(|id| s.agents.get(*id).is_some_and(|a| a.online))
+            .cloned()
+            .collect()
+    }
+
+    /// Send one command message per agent under a new job; `make` builds the
+    /// message from the command id. Offline agents are marked skipped.
+    fn dispatch(
+        &mut self,
+        kind: JobKind,
+        title: String,
+        detail: String,
+        ids: &[String],
+        make: impl Fn(String) -> MasterMsg,
+    ) -> u64 {
+        let mut s = self.state.lock().unwrap();
+        let job = s.create_job(kind, title.clone(), detail, ids);
+        let mut sent = 0;
         for id in ids {
-            self.send_to(
-                id,
-                MasterMsg::SetConfig {
-                    command_id: Self::new_command_id(),
-                    updates: updates.clone(),
-                },
-            );
+            let cid = Self::new_command_id();
+            let ok = s.agents.get(id).is_some_and(|a| a.send(make(cid.clone())));
+            if ok {
+                s.attach_command(job, id, &cid);
+                sent += 1;
+            } else {
+                s.finish_target(job, id, TargetStatus::Skipped, "offline — not sent");
+            }
         }
-        if let Ok(mut s) = self.state.lock() {
-            s.log(format!(
-                "remote config ({}) sent to {} agent(s)",
-                keys.join(", "),
-                ids.len()
-            ));
-        }
+        s.log(format!("{title}: sent to {sent} of {} PC(s)", ids.len()));
+        drop(s);
+        self.toast(format!("{title} → {sent} PC(s)"));
+        job
+    }
+
+    fn run_script(&mut self, script: String, ids: &[String]) -> u64 {
+        let first = script.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let title = format!("PowerShell: {}", truncate(first.trim(), 48));
+        self.dispatch(JobKind::Script, title, script.clone(), ids, |cid| {
+            MasterMsg::RunPowerShell {
+                command_id: cid,
+                script: script.clone(),
+            }
+        })
+    }
+
+    fn update_agents(&mut self, ids: Vec<String>) {
+        let Some(p) = &self.package else { return };
+        let version = p.version;
+        let job = {
+            let mut s = self.state.lock().unwrap();
+            s.create_job(
+                JobKind::Update,
+                format!("Agent update to {version}"),
+                p.path.display().to_string(),
+                &ids,
+            )
+        };
+        let n = ids.len();
+        agentpkg::start_update(
+            self.state.clone(),
+            p,
+            ids,
+            &self.settings.emanagement_url,
+            Self::new_command_id,
+            Some(job),
+        );
+        self.toast(format!("Updating {n} agent(s) to {version}"));
     }
 
     /// Stream a local installer/file to each listed agent and run it. The file
     /// is read once; each agent gets its own transfer, a few at a time.
-    fn push_file_to(&self, path: std::path::PathBuf, ids: Vec<String>) {
+    fn push_file_to(&mut self, path: std::path::PathBuf, ids: Vec<String>) {
         let args = split_args(&self.install_args);
         let is_msi = self.install_is_msi
             || path
@@ -284,6 +741,16 @@ impl App {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "installer.exe".into());
+        let job = {
+            let mut s = self.state.lock().unwrap();
+            s.create_job(
+                JobKind::Install,
+                format!("Install {file_name}"),
+                path.display().to_string(),
+                &ids,
+            )
+        };
+        self.toast(format!("Pushing {file_name} to {} PC(s)", ids.len()));
         let state = self.state.clone();
         std::thread::spawn(move || {
             let data = match std::fs::read(&path) {
@@ -291,6 +758,14 @@ impl App {
                 Err(e) => {
                     if let Ok(mut s) = state.lock() {
                         s.log(format!("cannot read {}: {e}", path.display()));
+                        for id in &ids {
+                            s.finish_target(
+                                job,
+                                id,
+                                TargetStatus::Failed,
+                                &format!("cannot read file: {e}"),
+                            );
+                        }
                     }
                     return;
                 }
@@ -315,6 +790,9 @@ impl App {
                         args: args.clone(),
                         is_msi,
                     };
+                    if let Ok(mut s) = state.lock() {
+                        s.attach_command(job, &id, &run.command_id);
+                    }
                     // Waits for the agent's acks before taking the next PC, so
                     // memory stays bounded however big the fleet is.
                     let outcome = agentpkg::send_file_and_wait(
@@ -327,12 +805,15 @@ impl App {
                     );
                     if outcome != agentpkg::SendOutcome::Delivered {
                         if let Ok(mut s) = state.lock() {
-                            let host = s
-                                .agents
-                                .get(&id)
-                                .map(|a| a.hostname.clone())
-                                .unwrap_or(id.clone());
-                            s.log(format!("{host}: {file_name} not delivered ({outcome:?})"));
+                            let host = s.hostname_of(&id);
+                            let note = format!("{file_name} not delivered ({outcome:?})");
+                            s.log(format!("{host}: {note}"));
+                            let status = if outcome == agentpkg::SendOutcome::Offline {
+                                TargetStatus::Skipped
+                            } else {
+                                TargetStatus::Failed
+                            };
+                            s.finish_target(job, &id, status, &note);
                         }
                     }
                 }));
@@ -341,1192 +822,709 @@ impl App {
                 let _ = w.join();
             }
             if let Ok(mut s) = state.lock() {
-                s.log(format!("installer {file_name} pushed to the fleet"));
+                s.log(format!("installer {file_name} pushed"));
             }
         });
     }
 
-    fn install_url_on(&self, url: String, ids: &[String]) {
+    fn install_url_on(&mut self, url: String, ids: &[String]) {
         let is_msi = self.install_is_msi;
         let args = split_args(&self.install_args);
-        for id in ids {
-            let run = RunSpec {
-                command_id: Self::new_command_id(),
-                args: args.clone(),
-                is_msi,
-            };
-            self.send_to(
-                id,
-                MasterMsg::InstallFromUrl {
-                    command_id: run.command_id.clone(),
-                    url: url.clone(),
-                    run,
+        let name = url.rsplit('/').next().unwrap_or(&url).to_string();
+        self.dispatch(
+            JobKind::Install,
+            format!("Install {}", truncate(&name, 40)),
+            url.clone(),
+            ids,
+            |cid| MasterMsg::InstallFromUrl {
+                command_id: cid.clone(),
+                url: url.clone(),
+                run: RunSpec {
+                    command_id: cid,
+                    args: args.clone(),
+                    is_msi,
                 },
-            );
+            },
+        );
+    }
+
+    fn notify(&mut self, title: String, body: String, ids: &[String]) {
+        let mut s = self.state.lock().unwrap();
+        let job = s.create_job(
+            JobKind::Notify,
+            format!("Message: {}", truncate(&body, 40)),
+            body.clone(),
+            ids,
+        );
+        let mut sent = 0;
+        for id in ids {
+            let ok = s.agents.get(id).is_some_and(|a| {
+                a.send(MasterMsg::NotifyUser {
+                    title: title.clone(),
+                    body: body.clone(),
+                })
+            });
+            if ok {
+                sent += 1;
+                s.finish_target(job, id, TargetStatus::Succeeded, "delivered to the agent");
+            } else {
+                s.finish_target(job, id, TargetStatus::Skipped, "offline — not sent");
+            }
+        }
+        s.log(format!("message sent to {sent} PC(s)"));
+        drop(s);
+        self.toast(format!("Message sent to {sent} PC(s)"));
+    }
+
+    fn set_config_on(&mut self, ids: &[String], updates: Vec<ConfigUpdate>) {
+        if updates.is_empty() || ids.is_empty() {
+            return;
+        }
+        let keys: Vec<String> = updates.iter().map(|u| u.key.clone()).collect();
+        self.dispatch(
+            JobKind::Config,
+            format!("Config: {}", keys.join(", ")),
+            keys.join(", "),
+            ids,
+            |cid| MasterMsg::SetConfig {
+                command_id: cid,
+                updates: updates.clone(),
+            },
+        );
+    }
+
+    fn wake(&mut self, ids: &[String]) {
+        let targets: Vec<(String, Vec<String>, Vec<String>)> = {
+            let s = self.state.lock().unwrap();
+            ids.iter()
+                .filter_map(|id| s.agents.get(id))
+                .map(|a| (a.hostname.clone(), a.last_macs.clone(), a.last_ips.clone()))
+                .collect()
+        };
+        let mut woke = 0;
+        let mut no_mac = Vec::new();
+        for (host, macs, ips) in targets {
+            match crate::wol::wake(&macs, &ips) {
+                Ok(n) if n > 0 => woke += 1,
+                _ => no_mac.push(host),
+            }
         }
         if let Ok(mut s) = self.state.lock() {
-            s.log(format!("install-from-URL sent to {} agent(s)", ids.len()));
+            s.log(format!("Wake-on-LAN sent for {woke} PC(s)"));
+        }
+        if no_mac.is_empty() {
+            self.toast(format!("Wake-on-LAN packet sent to {woke} PC(s)"));
+        } else {
+            self.toast_err(format!(
+                "No known MAC for: {}",
+                truncate(&no_mac.join(", "), 60)
+            ));
         }
     }
 
-    /// Unique id per command. A bare millisecond timestamp collided when one
-    /// click sent several messages (e.g. "Run on ALL", or a file push).
-    fn new_command_id() -> String {
-        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{}-{n}", chrono::Local::now().timestamp_millis())
+    fn forget(&mut self, ids: &[String]) {
+        let mut s = self.state.lock().unwrap();
+        let mut n = 0;
+        for id in ids {
+            if s.agents.get(id).is_some_and(|a| !a.online) {
+                s.agents.remove(id);
+                n += 1;
+            }
+        }
+        crate::state::save_known(&s);
+        s.log(format!("removed {n} offline PC(s) from the list"));
+        drop(s);
+        for id in ids {
+            self.checked.remove(id);
+            self.textures.remove(id);
+        }
+        if let Page::Device(id) = &self.page {
+            if ids.contains(id) {
+                self.page = Page::Devices;
+            }
+        }
+        self.toast(format!("Removed {n} PC(s)"));
+    }
+
+    fn set_tags(&mut self, ids: &[String], add: &[String], remove: &[String]) {
+        let mut s = self.state.lock().unwrap();
+        for id in ids {
+            if let Some(a) = s.agents.get_mut(id) {
+                for t in add {
+                    if !a.tags.iter().any(|x| x.eq_ignore_ascii_case(t)) {
+                        a.tags.push(t.clone());
+                    }
+                }
+                a.tags
+                    .retain(|x| !remove.iter().any(|r| r.eq_ignore_ascii_case(x)));
+                a.tags.sort_by_key(|t| t.to_lowercase());
+            }
+        }
+        crate::state::save_known(&s);
+    }
+
+    /// Run a confirmed action.
+    fn execute(&mut self, action: Action) {
+        match action {
+            Action::RunScript { script, ids } => {
+                self.remember_script(&script);
+                let job = self.run_script(script, &ids);
+                if ids.len() > 1 {
+                    self.selected_job = Some(job);
+                }
+            }
+            Action::InstallFile { path, ids } => {
+                self.push_file_to(std::path::PathBuf::from(path), ids)
+            }
+            Action::InstallUrl { url, ids } => self.install_url_on(url, &ids),
+            Action::Update { ids } => self.update_agents(ids),
+            Action::Power { kind, ids } => {
+                let script = kind.script();
+                self.dispatch(
+                    JobKind::Power,
+                    kind.label().to_string(),
+                    script.clone(),
+                    &ids,
+                    |cid| MasterMsg::RunPowerShell {
+                        command_id: cid,
+                        script: script.clone(),
+                    },
+                );
+            }
+            Action::Uninstall { name, targets } => {
+                let mut s = self.state.lock().unwrap();
+                let ids: Vec<String> = targets.iter().map(|t| t.0.clone()).collect();
+                let job = s.create_job(
+                    JobKind::Uninstall,
+                    format!("Uninstall {name}"),
+                    name.clone(),
+                    &ids,
+                );
+                let mut sent = 0;
+                for (id, uninstall) in &targets {
+                    let cid = Self::new_command_id();
+                    let ok = s.agents.get(id).is_some_and(|a| {
+                        a.send(MasterMsg::RunPowerShell {
+                            command_id: cid.clone(),
+                            script: uninstall_script(uninstall),
+                        })
+                    });
+                    if ok {
+                        s.attach_command(job, id, &cid);
+                        sent += 1;
+                    } else {
+                        s.finish_target(job, id, TargetStatus::Skipped, "offline — not sent");
+                    }
+                }
+                s.log(format!("uninstall {name} sent to {sent} PC(s)"));
+                drop(s);
+                self.toast(format!("Uninstalling {name} on {sent} PC(s)"));
+            }
+            Action::SetConfig { ids, updates } => self.set_config_on(&ids, updates),
+            Action::Notify { title, body, ids } => self.notify(title, body, &ids),
+            Action::Forget { ids } => self.forget(&ids),
+        }
+    }
+
+    fn remember_script(&mut self, script: &str) {
+        let s = script.trim().to_string();
+        if s.is_empty() {
+            return;
+        }
+        self.ps_history.retain(|h| *h != s);
+        self.ps_history.push(s);
+        if self.ps_history.len() > 50 {
+            self.ps_history.remove(0);
+        }
+        self.ps_history_pos = None;
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Keep the UI live for telemetry/screen updates.
-        ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        ctx.request_repaint_after(Duration::from_millis(250));
 
-        self.top_bar(ctx);
-        self.left_panel(ctx);
-        self.central(ctx);
-        if self.show_config {
-            self.config_window(ctx);
+        self.shortcuts(ctx);
+        let rows = self.snapshot();
+
+        self.sidebar(ctx, &rows);
+        self.status_bar(ctx, &rows);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(self.pal.bg)
+                    .inner_margin(egui::Margin::symmetric(26.0, 20.0)),
+            )
+            .show(ctx, |ui| match self.page.clone() {
+                Page::Dashboard => self.page_dashboard(ui, &rows),
+                Page::Devices => self.page_devices(ui, &rows),
+                Page::Software => self.page_software(ui, &rows),
+                Page::Jobs => self.page_jobs(ui),
+                Page::Activity => self.page_activity(ui),
+                Page::Deploy => self.page_deploy(ui),
+                Page::Device(id) => self.page_device(ui, &id, &rows),
+            });
+
+        if self.composer.is_some() {
+            self.composer_window(ctx, &rows);
         }
-        if self.pending_run_all.is_some() {
-            self.confirm_run_all_window(ctx);
+        if self.confirm.is_some() {
+            self.confirm_window(ctx);
         }
-        if self.pending_update.is_some() {
-            self.confirm_update_window(ctx);
-        }
-        if self.pending_install_all.is_some() {
-            self.confirm_install_all_window(ctx);
-        }
-        if self.show_remote_cfg {
-            self.remote_config_window(ctx);
-        }
+        self.draw_toasts(ctx);
     }
 }
 
 impl App {
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("FleetView");
-                ui.label(
-                    egui::RichText::new(format!("v{} · by Akulav", env!("CARGO_PKG_VERSION")))
-                        .weak(),
-                );
-                ui.separator();
-                let (online, total, listening, err, name) = {
-                    let s = self.state.lock().unwrap();
-                    (
-                        s.online_count(),
-                        s.total_ever_seen(),
-                        s.listening,
-                        s.listen_error.clone(),
-                        s.master_name.clone(),
-                    )
-                };
-                ui.label(name.to_string());
-                ui.separator();
-                if listening {
-                    ui.colored_label(egui::Color32::from_rgb(40, 180, 120), "● listening");
-                } else {
-                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), "● not listening");
-                }
-                ui.separator();
-                ui.strong(format!("Online: {online}"));
-                ui.label(format!("/ ever seen: {total}"));
-                if let Some(e) = err {
-                    ui.separator();
-                    ui.colored_label(egui::Color32::from_rgb(200, 80, 80), e);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Agent installer").clicked() {
-                        self.config_text = self
-                            .settings
-                            .agent_config_json(None)
-                            .unwrap_or_else(|e| format!("error: {e}"));
-                        self.config_status.clear();
-                        self.show_config = true;
-                    }
-                });
-            });
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let (find, back, esc) = ctx.input(|i| {
+            (
+                i.modifiers.command && i.key_pressed(egui::Key::F),
+                (i.modifiers.alt && i.key_pressed(egui::Key::ArrowLeft))
+                    || i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.key_pressed(egui::Key::Escape),
+            )
         });
-    }
-
-    fn left_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("agents")
-            .resizable(true)
-            .default_width(240.0)
-            .show(ctx, |ui| {
-                ui.add_space(4.0);
-                if ui
-                    .selectable_label(self.selected.is_none(), "🖥  Fleet overview")
-                    .clicked()
-                {
-                    self.selected = None;
-                }
-                ui.separator();
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    let agents: Vec<(String, String, bool, f32, String)> = {
-                        let s = self.state.lock().unwrap();
-                        s.agents
-                            .values()
-                            .map(|a| {
-                                let cpu =
-                                    a.telemetry.as_ref().map(|t| t.cpu_usage_pct).unwrap_or(0.0);
-                                (
-                                    a.agent_id.clone(),
-                                    a.hostname.clone(),
-                                    a.online,
-                                    cpu,
-                                    a.agent_version.clone(),
-                                )
-                            })
-                            .collect()
-                    };
-                    for (id, host, online, cpu, version) in agents {
-                        let dot = if online { "🟢" } else { "⚪" };
-                        let outdated = self.update_state_of(&version) == UpdateState::Outdated;
-                        let mark = if outdated { "  ⬆" } else { "" };
-                        let label = if online {
-                            format!("{dot} {host}  ({cpu:.0}%){mark}")
-                        } else {
-                            format!("{dot} {host}{mark}")
-                        };
-                        if ui
-                            .selectable_label(self.selected.as_deref() == Some(&id), label)
-                            .clicked()
-                        {
-                            self.selected = Some(id.clone());
-                        }
-                    }
-                });
-            });
-    }
-
-    fn central(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| match self.selected.clone() {
-            None => self.fleet_overview(ui),
-            Some(id) => self.agent_view(ui, &id),
-        });
-    }
-
-    fn fleet_overview(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Fleet overview");
-        ui.add_space(6.0);
-        self.updates_panel(ui);
-        self.fleet_actions_panel(ui);
-        ui.add_space(6.0);
-        let rows: Vec<([String; 5], String)> = {
-            let s = self.state.lock().unwrap();
-            s.agents
-                .values()
-                .map(|a| {
-                    let ips = a
-                        .telemetry
-                        .as_ref()
-                        .map(|t| t.ip_addresses.join(", "))
-                        .unwrap_or_default();
-                    let user = a
-                        .telemetry
-                        .as_ref()
-                        .and_then(|t| t.logged_in_user.clone())
-                        .unwrap_or_default();
-                    (
-                        [
-                            format!("{} {}", if a.online { "🟢" } else { "⚪" }, a.hostname),
-                            user,
-                            ips,
-                            a.last_seen.format("%Y-%m-%d %H:%M").to_string(),
-                            a.telemetry
-                                .as_ref()
-                                .map(|t| format!("{:.0}% CPU", t.cpu_usage_pct))
-                                .unwrap_or_default(),
-                        ],
-                        a.agent_version.clone(),
-                    )
-                })
-                .collect()
-        };
-
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("fleet_grid")
-                .striped(true)
-                .num_columns(6)
-                .spacing([16.0, 6.0])
-                .show(ui, |ui| {
-                    ui.strong("Host");
-                    ui.strong("User");
-                    ui.strong("IP addresses");
-                    ui.strong("Last seen");
-                    ui.strong("CPU");
-                    ui.strong("Agent");
-                    ui.end_row();
-                    for (r, version) in &rows {
-                        for cell in r {
-                            ui.label(cell);
-                        }
-                        self.version_label(ui, version);
-                        ui.end_row();
-                    }
-                });
-            ui.add_space(12.0);
-            ui.collapsing("Events", |ui| {
-                let events: Vec<String> =
-                    self.state.lock().unwrap().events.iter().cloned().collect();
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        for e in events {
-                            ui.monospace(e);
-                        }
-                    });
-            });
-        });
-    }
-
-    fn version_label(&self, ui: &mut egui::Ui, version: &str) {
-        let text = if version.is_empty() { "—" } else { version };
-        match self.update_state_of(version) {
-            UpdateState::Outdated => {
-                ui.colored_label(AMBER, format!("{text} ⬆"))
-                    .on_hover_text("Older than the agent package: can be updated");
+        if find {
+            if !matches!(self.page, Page::Devices | Page::Software | Page::Activity) {
+                self.go(Page::Devices);
             }
-            UpdateState::Current => {
-                ui.colored_label(GREEN, text);
-            }
-            _ => {
-                ui.label(text);
+            self.focus_search = true;
+        }
+        if back && self.confirm.is_none() && self.composer.is_none() {
+            self.go_back();
+        }
+        if esc {
+            if self.confirm.is_some() {
+                self.confirm = None;
+            } else if self.composer.is_some() {
+                self.composer = None;
             }
         }
     }
 
-    /// Agent package + fleet-wide update controls.
-    fn updates_panel(&mut self, ui: &mut egui::Ui) {
-        let outdated = self.outdated_online();
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Agent updates");
-                ui.separator();
-                match &self.package {
-                    Some(p) => {
-                        ui.label(format!("Package: agent {}", p.version))
-                            .on_hover_text(p.path.display().to_string());
-                    }
-                    None => {
-                        ui.colored_label(AMBER, "No agent package")
-                            .on_hover_text(&self.package_error);
-                    }
-                }
-                if ui.button("Choose agent exe…").clicked() {
-                    self.choose_package();
-                }
-                if ui
-                    .button("↻")
-                    .on_hover_text("Reload the package file")
-                    .clicked()
-                {
-                    self.load_package();
-                }
-                ui.separator();
-                let n = outdated.len();
-                let btn = ui.add_enabled(
-                    n > 0,
-                    egui::Button::new(format!("⬆ Update {n} outdated online PC(s)")),
-                );
-                if btn.clicked() {
-                    self.pending_update = Some(outdated.clone());
-                }
-                // Update / reinstall every online agent that isn't newer than
-                // the package (never a downgrade).
-                let all = self.updatable_online();
-                let m = all.len();
-                if ui
-                    .add_enabled(
-                        self.package.is_some() && m > 0,
-                        egui::Button::new(format!("⟳ Update/repair all {m} online")),
-                    )
-                    .on_hover_text("Push the package to every online PC (skips newer ones)")
-                    .clicked()
-                {
-                    self.pending_update = Some(all);
-                }
-            });
-        });
-    }
-
-    /// Fleet-wide actions: push an installer / URL to every online PC, and open
-    /// the remote-config editor. (Updates are in `updates_panel` above.)
-    fn fleet_actions_panel(&mut self, ui: &mut egui::Ui) {
-        let online = self.online_ids();
-        let n = online.len();
-        egui::Frame::group(ui.style()).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Fleet actions");
-                ui.separator();
-                ui.label(format!("{n} online"));
-                ui.separator();
-                if ui
-                    .add_enabled(n > 0, egui::Button::new("⬇ Install file on all…"))
-                    .clicked()
-                {
-                    if let Some(path) = rfd::FileDialog::new().pick_file() {
-                        self.pending_install_all = Some((path.display().to_string(), false));
-                    }
-                }
-                ui.checkbox(&mut self.install_is_msi, "MSI");
-                ui.label("args:");
-                ui.add(egui::TextEdit::singleline(&mut self.install_args).desired_width(90.0));
-                ui.separator();
-                ui.label("URL:");
-                ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(200.0));
-                let url_ok = self.url_input.trim().to_lowercase().starts_with("https://");
-                if ui
-                    .add_enabled(n > 0 && url_ok, egui::Button::new("⬇ URL on all…"))
-                    .on_disabled_hover_text("Enter an https:// URL")
-                    .clicked()
-                {
-                    self.pending_install_all = Some((self.url_input.trim().to_string(), true));
-                }
-                ui.separator();
-                if ui.button("⚙ Remote config…").clicked() {
-                    self.rc_status.clear();
-                    self.show_remote_cfg = true;
-                }
-            });
-        });
-    }
-
-    fn confirm_install_all_window(&mut self, ctx: &egui::Context) {
-        let Some((target, is_url)) = self.pending_install_all.clone() else {
-            return;
-        };
-        let ids = self.online_ids();
-        let mut decision: Option<bool> = None;
-        egui::Window::new("Install on all online PCs?")
-            .collapsible(false)
+    fn sidebar(&mut self, ctx: &egui::Context, rows: &[DeviceRow]) {
+        let pal = self.pal;
+        egui::SidePanel::left("nav")
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .exact_width(236.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(pal.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(egui::Margin::symmetric(12.0, 14.0)),
+            )
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Run this on {} online PC(s) as SYSTEM{}:",
-                    ids.len(),
-                    if self.install_is_msi { " (MSI)" } else { "" }
-                ));
-                ui.add_space(4.0);
-                ui.monospace(&target);
-                ui.label(format!("Silent args: {}", self.install_args));
-                ui.add_space(6.0);
+                // Brand
                 ui.horizontal(|ui| {
-                    if ui
-                        .button(format!("Install on {} PC(s)", ids.len()))
-                        .clicked()
-                    {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
+                    let (r, _) = ui.allocate_exact_size(vec2(32.0, 32.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(r, egui::Rounding::same(9.0), pal.accent);
+                    ui.painter().text(
+                        r.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "F",
+                        semibold(18.0),
+                        Color32::WHITE,
+                    );
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(
+                            RichText::new("FleetView")
+                                .font(semibold(16.0))
+                                .color(pal.text),
+                        );
+                        ui.label(
+                            RichText::new(format!("Master v{}", env!("CARGO_PKG_VERSION")))
+                                .size(11.5)
+                                .color(pal.text_faint),
+                        );
+                    });
                 });
-            });
-        match decision {
-            Some(true) => {
-                self.pending_install_all = None;
-                if is_url {
-                    self.install_url_on(target, &ids);
-                } else {
-                    self.push_file_to(std::path::PathBuf::from(target), ids);
-                }
-            }
-            Some(false) => self.pending_install_all = None,
-            None => {}
-        }
-    }
+                ui.add_space(14.0);
 
-    fn remote_config_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_remote_cfg;
-        let selected = self.selected.clone();
-        egui::Window::new("Remote config")
-            .open(&mut open)
-            .default_width(560.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    "Change agent config on running PCs. The agent applies only these keys \
-                     (never its master identity or enrollment secret) and restarts to pick them \
-                     up. An empty value clears the key.",
-                );
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.rc_scope_all, true, "All online PCs");
-                    let one = selected.is_some();
-                    ui.add_enabled_ui(one, |ui| {
-                        ui.radio_value(&mut self.rc_scope_all, false, "Selected PC only");
-                    });
-                    if !one {
-                        self.rc_scope_all = true;
-                    }
-                });
-                ui.separator();
-                egui::Grid::new("rc_grid")
-                    .num_columns(2)
-                    .spacing([8.0, 6.0])
-                    .show(ui, |ui| {
-                        for f in self.rc.iter_mut() {
-                            ui.checkbox(&mut f.apply, f.label);
-                            ui.add(
-                                egui::TextEdit::singleline(&mut f.value)
-                                    .desired_width(320.0)
-                                    .hint_text(f.hint),
-                            );
-                            ui.end_row();
-                        }
-                    });
-                ui.add_space(6.0);
-                let updates: Vec<ConfigUpdate> = self
-                    .rc
+                let online = rows.iter().filter(|r| r.online).count();
+                let attention = rows
                     .iter()
-                    .filter(|f| f.apply)
-                    .map(|f| ConfigUpdate {
-                        key: f.key.to_string(),
-                        value: {
-                            let v = f.value.trim();
-                            if v.is_empty() {
-                                None
-                            } else {
-                                Some(v.to_string())
-                            }
-                        },
-                    })
-                    .collect();
-                let ids = if self.rc_scope_all {
-                    self.online_ids()
-                } else {
-                    selected.clone().into_iter().collect()
-                };
-                ui.horizontal(|ui| {
-                    let can = !updates.is_empty() && !ids.is_empty();
-                    if ui
-                        .add_enabled(
-                            can,
-                            egui::Button::new(format!("Apply to {} PC(s)", ids.len())),
-                        )
-                        .clicked()
-                    {
-                        let n = updates.len();
-                        self.set_config_on(&ids, updates);
-                        self.rc_status = format!(
-                            "Sent {n} key(s) to {} PC(s). Watch the Events log.",
-                            ids.len()
-                        );
-                    }
-                    if !self.rc_status.is_empty() {
-                        ui.label(&self.rc_status);
-                    }
-                });
-            });
-        self.show_remote_cfg = open;
-    }
+                    .filter(|r| r.worst().is_some_and(|s| s >= Severity::Warn))
+                    .count();
+                let running = self.state.lock().unwrap().running_jobs();
+                let on_device = matches!(self.page, Page::Device(_));
 
-    fn confirm_update_window(&mut self, ctx: &egui::Context) {
-        let Some(ids) = self.pending_update.clone() else {
-            return;
-        };
-        let version = self
-            .package
-            .as_ref()
-            .map(|p| p.version.to_string())
-            .unwrap_or_default();
-        let hosts: Vec<String> = {
-            let s = self.state.lock().unwrap();
-            ids.iter()
-                .filter_map(|id| s.agents.get(id))
-                .map(|a| format!("{} ({})", a.hostname, a.agent_version))
-                .collect()
-        };
-        let mut decision: Option<bool> = None;
-        egui::Window::new("Update agents?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "Install agent {version} on {} PC(s). Each agent restarts (a few seconds \
-                     offline) and rolls back by itself if the new version doesn't start.",
-                    ids.len()
-                ));
-                if !self.settings.emanagement_url.trim().is_empty() {
-                    ui.label(format!(
-                        "MoldSign bridge: e-Management URL set to {}",
-                        self.settings.emanagement_url.trim()
-                    ));
-                }
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .max_height(200.0)
-                    .show(ui, |ui| {
-                        for h in &hosts {
-                            ui.label(h);
-                        }
-                    });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button(format!("Update {} PC(s)", ids.len())).clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        match decision {
-            Some(true) => {
-                self.pending_update = None;
-                self.update_agents(ids);
-            }
-            Some(false) => self.pending_update = None,
-            None => {}
-        }
-    }
-
-    fn agent_view(&mut self, ui: &mut egui::Ui, id: &str) {
-        let (hostname, online) = {
-            let s = self.state.lock().unwrap();
-            match s.agents.get(id) {
-                Some(a) => (a.hostname.clone(), a.online),
-                None => (id.to_string(), false),
-            }
-        };
-        ui.horizontal(|ui| {
-            ui.heading(&hostname);
-            if online {
-                ui.colored_label(egui::Color32::from_rgb(40, 180, 120), "online");
-            } else {
-                ui.colored_label(egui::Color32::GRAY, "offline");
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Overview, "Overview");
-            ui.selectable_value(&mut self.tab, Tab::Software, "Software");
-            ui.selectable_value(&mut self.tab, Tab::PowerShell, "PowerShell");
-            ui.selectable_value(&mut self.tab, Tab::Screen, "Screen");
-        });
-        ui.separator();
-        match self.tab {
-            Tab::Overview => self.tab_overview(ui, id),
-            Tab::Software => self.tab_software(ui, id),
-            Tab::PowerShell => self.tab_powershell(ui, id),
-            Tab::Screen => self.tab_screen(ui, id),
-        }
-    }
-
-    fn send_to(&self, id: &str, msg: MasterMsg) {
-        let s = self.state.lock().unwrap();
-        if let Some(a) = s.agents.get(id) {
-            a.send(msg);
-        }
-    }
-
-    fn tab_overview(&mut self, ui: &mut egui::Ui, id: &str) {
-        if ui.button("↻ Refresh telemetry").clicked() {
-            self.send_to(id, MasterMsg::RequestTelemetry);
-        }
-        ui.add_space(6.0);
-        self.agent_update_row(ui, id);
-        ui.add_space(6.0);
-        let t = {
-            let s = self.state.lock().unwrap();
-            s.agents.get(id).and_then(|a| a.telemetry.clone())
-        };
-        let Some(t) = t else {
-            ui.label("No telemetry yet…");
-            return;
-        };
-        egui::Grid::new("tele")
-            .num_columns(2)
-            .spacing([14.0, 4.0])
-            .show(ui, |ui| {
-                ui.strong("OS");
-                ui.label(&t.os_version);
-                ui.end_row();
-                ui.strong("Logged-in user");
-                ui.label(t.logged_in_user.clone().unwrap_or_else(|| "—".into()));
-                ui.end_row();
-                ui.strong("CPU");
-                ui.label(format!(
-                    "{} ({} cores) — {:.0}%",
-                    t.cpu_name, t.cpu_cores, t.cpu_usage_pct
-                ));
-                ui.end_row();
-                ui.strong("Memory");
-                ui.label(format!(
-                    "{} / {} MB ({:.0}%)",
-                    t.mem_used_mb,
-                    t.mem_total_mb,
-                    100.0 * t.mem_used_mb as f32 / t.mem_total_mb.max(1) as f32
-                ));
-                ui.end_row();
-                ui.strong("Uptime");
-                ui.label(format!("{} h", t.uptime_secs / 3600));
-                ui.end_row();
-                ui.strong("IP addresses");
-                ui.label(t.ip_addresses.join(", "));
-                ui.end_row();
-                ui.strong("MAC addresses");
-                ui.label(t.mac_addresses.join(", "));
-                ui.end_row();
-                ui.strong("Agent version");
-                ui.label(&t.agent_version);
-                ui.end_row();
-            });
-        ui.add_space(10.0);
-        ui.strong("Disks");
-        for d in &t.disks {
-            let used = d.total_gb - d.available_gb;
-            let frac = if d.total_gb > 0.0 {
-                (used / d.total_gb) as f32
-            } else {
-                0.0
-            };
-            ui.horizontal(|ui| {
-                ui.label(d.mount.to_string());
-                ui.add(
-                    egui::ProgressBar::new(frac)
-                        .desired_width(220.0)
-                        .text(format!("{:.0}/{:.0} GB", used, d.total_gb)),
-                );
-            });
-        }
-
-        ui.add_space(10.0);
-        ui.separator();
-        ui.strong("Notify this user");
-        ui.horizontal(|ui| {
-            ui.label("Title");
-            ui.text_edit_singleline(&mut self.notify_title);
-        });
-        ui.horizontal(|ui| {
-            ui.label("Body");
-            ui.text_edit_singleline(&mut self.notify_body);
-            if ui.button("Send").clicked() && !self.notify_body.is_empty() {
-                self.send_to(
-                    id,
-                    MasterMsg::NotifyUser {
-                        title: self.notify_title.clone(),
-                        body: self.notify_body.clone(),
-                    },
-                );
-            }
-        });
-    }
-
-    /// Version of one agent + its update button and progress.
-    fn agent_update_row(&mut self, ui: &mut egui::Ui, id: &str) {
-        let (version, online, note, busy) = {
-            let s = self.state.lock().unwrap();
-            match s.agents.get(id) {
-                Some(a) => (
-                    a.agent_version.clone(),
-                    a.online,
-                    a.update_note.clone(),
-                    a.update_command.is_some(),
-                ),
-                None => return,
-            }
-        };
-        let state = self.update_state_of(&version);
-        let pkg_version = self.package.as_ref().map(|p| p.version);
-        ui.horizontal(|ui| {
-            ui.strong("Agent");
-            self.version_label(ui, &version);
-            if let Some(pv) = pkg_version {
-                let label = match state {
-                    UpdateState::Outdated => format!("⬆ Update to {pv}"),
-                    _ => format!("Reinstall {pv}"),
-                };
-                // Never downgrade from the UI.
-                let enabled = online && !busy && state != UpdateState::Newer;
-                if ui
-                    .add_enabled(enabled, egui::Button::new(label))
-                    .on_disabled_hover_text(if state == UpdateState::Newer {
-                        "The agent is newer than the package"
-                    } else {
-                        "The agent must be online"
-                    })
-                    .clicked()
-                {
-                    self.update_agents(vec![id.to_string()]);
-                }
-            }
-            if let Some(n) = note {
-                ui.label(egui::RichText::new(n).weak());
-            }
-        });
-    }
-
-    fn tab_software(&mut self, ui: &mut egui::Ui, id: &str) {
-        ui.horizontal(|ui| {
-            if ui.button("↻ Refresh inventory").clicked() {
-                self.send_to(id, MasterMsg::RequestSoftware);
-            }
-            ui.separator();
-            if ui.button("⬆ Install file…").clicked() {
-                self.push_installer(id);
-            }
-            ui.checkbox(&mut self.install_is_msi, "MSI");
-            ui.label("Silent args:");
-            ui.add(egui::TextEdit::singleline(&mut self.install_args).desired_width(120.0));
-        });
-        ui.horizontal(|ui| {
-            ui.label("Install from URL:");
-            ui.add(egui::TextEdit::singleline(&mut self.url_input).desired_width(260.0));
-            let url_ok = self.url_input.trim().to_lowercase().starts_with("https://");
-            if !self.url_input.trim().is_empty() && !url_ok {
-                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), "https:// only");
-            }
-            if ui
-                .add_enabled(url_ok, egui::Button::new("Download & run"))
-                .clicked()
-            {
-                let run = RunSpec {
-                    command_id: Self::new_command_id(),
-                    args: split_args(&self.install_args),
-                    is_msi: self.install_is_msi,
-                };
-                self.send_to(
-                    id,
-                    MasterMsg::InstallFromUrl {
-                        command_id: run.command_id.clone(),
-                        url: self.url_input.trim().to_string(),
-                        run,
-                    },
-                );
-            }
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Filter:");
-            ui.text_edit_singleline(&mut self.software_filter);
-        });
-
-        let filter = self.software_filter.to_lowercase();
-        let list: Vec<(String, String, String)> = {
-            let s = self.state.lock().unwrap();
-            s.agents
-                .get(id)
-                .map(|a| {
-                    a.software
-                        .iter()
-                        .filter(|e| filter.is_empty() || e.name.to_lowercase().contains(&filter))
-                        .map(|e| {
-                            (
-                                e.name.clone(),
-                                e.version.clone().unwrap_or_default(),
-                                e.uninstall_string.clone().unwrap_or_default(),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
-        ui.label(format!("{} program(s)", list.len()));
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("sw")
-                .striped(true)
-                .num_columns(3)
-                .spacing([12.0, 4.0])
-                .show(ui, |ui| {
-                    ui.strong("Name");
-                    ui.strong("Version");
-                    ui.strong("");
-                    ui.end_row();
-                    for (name, ver, uninstall) in &list {
-                        ui.label(name);
-                        ui.label(ver);
-                        if !uninstall.is_empty() {
-                            if ui.small_button("Uninstall").clicked() {
-                                let script = uninstall_script(uninstall);
-                                self.send_to(
-                                    id,
-                                    MasterMsg::RunPowerShell {
-                                        command_id: Self::new_command_id(),
-                                        script,
-                                    },
-                                );
-                            }
-                        } else {
-                            ui.label("");
-                        }
-                        ui.end_row();
-                    }
-                });
-        });
-    }
-
-    fn tab_powershell(&mut self, ui: &mut egui::Ui, id: &str) {
-        ui.label("Runs as SYSTEM (elevated) on the agent.");
-        ui.add(
-            egui::TextEdit::multiline(&mut self.ps_input)
-                .desired_rows(5)
-                .desired_width(f32::INFINITY)
-                .code_editor()
-                .hint_text("Get-Service | Where-Object Status -eq 'Running'"),
-        );
-        ui.horizontal(|ui| {
-            if ui.button("▶ Run").clicked() && !self.ps_input.trim().is_empty() {
-                let script = self.ps_input.clone();
-                if self.ps_run_all {
-                    // Running SYSTEM-level code on the whole fleet is never a
-                    // single click: ask first (see `confirm_run_all_window`).
-                    let ids: Vec<String> = {
-                        let s = self.state.lock().unwrap();
-                        s.agents
-                            .values()
-                            .filter(|a| a.online)
-                            .map(|a| a.agent_id.clone())
-                            .collect()
-                    };
-                    self.pending_run_all = Some((script, ids));
-                } else {
-                    self.send_to(
-                        id,
-                        MasterMsg::RunPowerShell {
-                            command_id: Self::new_command_id(),
-                            script,
-                        },
-                    );
-                }
-            }
-            ui.checkbox(&mut self.ps_run_all, "Run on ALL online agents");
-        });
-        ui.separator();
-        let output = {
-            let s = self.state.lock().unwrap();
-            s.agents
-                .get(id)
-                .map(|a| a.console_output.clone())
-                .unwrap_or_default()
-        };
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut output.as_str())
-                        .desired_rows(16)
-                        .desired_width(f32::INFINITY)
-                        .code_editor(),
-                );
-            });
-    }
-
-    fn tab_screen(&mut self, ui: &mut egui::Ui, id: &str) {
-        ui.horizontal(|ui| {
-            if ui.button("📷 Capture once").clicked() {
-                self.send_to(
-                    id,
-                    MasterMsg::RequestScreenshot {
-                        command_id: Self::new_command_id(),
-                    },
-                );
-            }
-            let streaming = {
-                let s = self.state.lock().unwrap();
-                s.agents.get(id).map(|a| a.streaming).unwrap_or(false)
-            };
-            if !streaming {
-                ui.add(egui::Slider::new(&mut self.stream_fps, 1..=10).text("fps"));
-                if ui.button("▶ Start live view").clicked() {
-                    let interval = (1000 / self.stream_fps.max(1)) as u64;
-                    self.send_to(
-                        id,
-                        MasterMsg::StartScreenStream {
-                            interval_ms: interval,
-                            jpeg_quality: 60,
-                        },
-                    );
-                    // The agent itself notifies the user (localized) when a
-                    // live view starts or a screenshot is taken.
-                    if let Ok(mut s) = self.state.lock() {
-                        if let Some(a) = s.agents.get_mut(id) {
-                            a.streaming = true;
-                        }
+                type NavItem<'a> = (&'a str, &'a str, Page, Option<(String, Color32)>);
+                let items: [NavItem; 6] = [
+                    (
+                        "🏠",
+                        "Dashboard",
+                        Page::Dashboard,
+                        (attention > 0).then(|| (attention.to_string(), pal.amber)),
+                    ),
+                    (
+                        "🖥",
+                        "Devices",
+                        Page::Devices,
+                        Some((format!("{online}/{}", rows.len()), pal.green)),
+                    ),
+                    ("📦", "Software", Page::Software, None),
+                    (
+                        "⚡",
+                        "Jobs",
+                        Page::Jobs,
+                        (running > 0).then(|| (format!("{running} running"), pal.blue)),
+                    ),
+                    ("📜", "Activity", Page::Activity, None),
+                    ("🚀", "Deploy & settings", Page::Deploy, None),
+                ];
+                for (icon, label, page, badge) in items {
+                    let selected = self.page == page || (on_device && page == Page::Devices);
+                    if w::nav_item(ui, &pal, icon, label, selected, badge).clicked() {
+                        self.go(page);
                     }
                 }
-            } else if ui.button("■ Stop live view").clicked() {
-                self.send_to(id, MasterMsg::StopScreenStream);
-                if let Ok(mut s) = self.state.lock() {
-                    if let Some(a) = s.agents.get_mut(id) {
-                        a.streaming = false;
-                    }
-                }
-            }
-        });
-        ui.separator();
 
-        // Update texture if a new frame arrived.
-        let frame = {
-            let s = self.state.lock().unwrap();
-            s.agents.get(id).and_then(|a| {
-                a.last_frame
-                    .as_ref()
-                    .map(|f| (a.frame_seq, f.width, f.height, f.jpeg.clone()))
-            })
-        };
-
-        if let Some((seq, _, _, jpeg)) = frame {
-            let need_update = self
-                .textures
-                .get(id)
-                .map(|(s, _)| *s != seq)
-                .unwrap_or(true);
-            if need_update {
-                if let Ok(img) = image::load_from_memory(&jpeg) {
-                    let rgba = img.to_rgba8();
-                    // Use the decoded size, not the agent-reported one: a
-                    // mismatch makes `from_rgba_unmultiplied` panic, which
-                    // aborts the whole master (panic = "abort" in release).
-                    let color = egui::ColorImage::from_rgba_unmultiplied(
-                        [rgba.width() as usize, rgba.height() as usize],
-                        rgba.as_raw(),
-                    );
-                    let tex = ui.ctx().load_texture(
-                        format!("screen_{id}"),
-                        color,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    self.textures.insert(id.to_string(), (seq, tex));
-                }
-            }
-            if let Some((_, tex)) = self.textures.get(id) {
-                let [w, h] = tex.size().map(|v| v.max(1) as f32);
-                let avail = ui.available_width().min(w);
-                let scale = avail / w;
-                let size = egui::vec2(w * scale, h * scale);
-                ui.image(egui::load::SizedTexture::new(tex.id(), size));
-            }
-        } else {
-            ui.label("No screenshot yet. Click “Capture once” or “Start live view”.");
-        }
-    }
-
-    fn push_installer(&mut self, id: &str) {
-        let Some(path) = rfd::FileDialog::new().pick_file() else {
-            return;
-        };
-        // Same path as the fleet-wide push (ack-tracked, logged on failure).
-        self.push_file_to(path, vec![id.to_string()]);
-    }
-
-    fn confirm_run_all_window(&mut self, ctx: &egui::Context) {
-        let Some((script, ids)) = self.pending_run_all.clone() else {
-            return;
-        };
-        let mut decision: Option<bool> = None;
-        egui::Window::new("Run on ALL online agents?")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "This runs the script below as SYSTEM on {} online PC(s).",
-                    ids.len()
-                ));
-                ui.add_space(4.0);
-                egui::ScrollArea::vertical()
-                    .max_height(200.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut script.as_str())
-                                .desired_width(420.0)
-                                .code_editor(),
-                        );
-                    });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let run = ui.add_enabled(
-                        !ids.is_empty(),
-                        egui::Button::new(format!("Run on {} PC(s)", ids.len())),
-                    );
-                    if run.clicked() {
-                        decision = Some(true);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        match decision {
-            Some(true) => {
-                for aid in &ids {
-                    self.send_to(
-                        aid,
-                        MasterMsg::RunPowerShell {
-                            command_id: Self::new_command_id(),
-                            script: script.clone(),
-                        },
-                    );
-                }
-                if let Ok(mut s) = self.state.lock() {
-                    s.log(format!("PowerShell sent to {} agent(s)", ids.len()));
-                }
-                self.pending_run_all = None;
-            }
-            Some(false) => self.pending_run_all = None,
-            None => {}
-        }
-    }
-
-    fn config_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_config;
-        egui::Window::new("Agent installer")
-            .open(&mut open)
-            .default_width(560.0)
-            .show(ctx, |ui| {
-                ui.label(
-                    "“Save agent setup” writes one .exe that installs the agent (or updates it) \
-                     on double-click. It carries the config below, which pins this master's \
-                     identity so agents trust only this master.",
-                );
-                ui.add_space(4.0);
-                let mut regenerate = false;
-                egui::Grid::new("cfg_fields")
-                    .num_columns(2)
-                    .spacing([8.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label("Fixed master address (optional, host:port):");
-                        if ui
-                            .text_edit_singleline(&mut self.config_master_addr)
-                            .lost_focus()
-                        {
-                            regenerate = true;
-                        }
-                        ui.end_row();
-                        ui.label("e-Management URL (MoldSign bridge, optional):")
-                            .on_hover_text(
-                                "e.g. http://docs.ansc.local:3080 — turns on document signing \
-                                 through the agent. Also applied by remote updates.",
-                            );
-                        if ui
-                            .text_edit_singleline(&mut self.emanagement_input)
-                            .lost_focus()
-                        {
-                            regenerate = true;
-                        }
-                        ui.end_row();
-                    });
-                if regenerate || ui.button("Apply").clicked() {
-                    let url = self.emanagement_input.trim().to_string();
-                    let valid =
-                        url.is_empty() || url.starts_with("http://") || url.starts_with("https://");
-                    if !valid {
-                        self.config_status = "The e-Management URL must start with http:// or \
-                                              https://"
-                            .into();
-                    } else if url != self.settings.emanagement_url {
-                        self.settings.emanagement_url = url;
-                        self.config_status = match self.settings.save() {
-                            Ok(()) => "Saved.".into(),
-                            Err(e) => format!("Cannot save settings: {e:#}"),
-                        };
-                    }
-                    let addr = if self.config_master_addr.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.config_master_addr.trim().to_string())
-                    };
-                    self.config_text = self
-                        .settings
-                        .agent_config_json(addr)
-                        .unwrap_or_else(|e| format!("error: {e}"));
-                }
+                ui.add_space(12.0);
                 ui.separator();
-                egui::ScrollArea::vertical()
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.config_text.as_str())
-                                .desired_width(f32::INFINITY)
-                                .code_editor(),
-                        );
-                    });
-                ui.horizontal(|ui| {
-                    let save_setup = ui.add_enabled(
-                        self.package.is_some(),
-                        egui::Button::new("💾 Save agent setup (.exe)…"),
-                    );
-                    if save_setup.clicked() {
-                        self.save_agent_setup();
-                    }
-                    if ui.button("Copy config").clicked() {
-                        ui.ctx().copy_text(self.config_text.clone());
-                    }
-                    if ui.button("Save config as JSON…").clicked() {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .set_file_name("agent.config.json")
-                            .save_file()
-                        {
-                            let _ = std::fs::write(path, &self.config_text);
-                        }
-                    }
-                });
-                match &self.package {
-                    Some(p) => ui.label(
-                        egui::RichText::new(format!(
-                            "Agent package {} — {}",
-                            p.version,
-                            p.path.display()
-                        ))
-                        .weak(),
-                    ),
-                    None => ui.colored_label(
-                        AMBER,
-                        format!(
-                            "No agent package ({}). Use “Choose agent exe…” in Fleet overview.",
-                            self.package_error
-                        ),
-                    ),
-                };
-                if !self.config_status.is_empty() {
-                    ui.label(&self.config_status);
-                }
                 ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Keep the enrollment secret private — anyone with it can enroll an agent.",
-                    )
-                    .weak(),
+                w::card_title(ui, &pal, "Quick find");
+                ui.add_space(2.0);
+                w::search_box(
+                    ui,
+                    &mut self.sidebar_search,
+                    "Host, user or IP",
+                    ui.available_width(),
                 );
+                ui.add_space(4.0);
+
+                let q = self.sidebar_search.to_lowercase();
+                let mut list: Vec<&DeviceRow> = rows
+                    .iter()
+                    .filter(|r| q.is_empty() || row_matches(r, &q))
+                    .collect();
+                list.sort_by(|a, b| {
+                    b.online
+                        .cmp(&a.online)
+                        .then_with(|| a.host.to_lowercase().cmp(&b.host.to_lowercase()))
+                });
+                let footer_h = 36.0;
+                egui::ScrollArea::vertical()
+                    .max_height(ui.available_height() - footer_h)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for r in list {
+                            let selected = self.page == Page::Device(r.id.clone());
+                            if self.device_list_item(ui, r, selected).clicked() {
+                                self.open_device(&r.id);
+                            }
+                        }
+                        if rows.is_empty() {
+                            w::faint(ui, &pal, "No PCs yet. Install the agent from Deploy.");
+                        }
+                    });
+
+                // Footer: theme toggle
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.horizontal(|ui| {
+                        let dark = self.prefs.dark;
+                        let label = if dark {
+                            "☀  Light mode"
+                        } else {
+                            "🌙  Dark mode"
+                        };
+                        if w::ghost(ui, label).clicked() {
+                            self.set_dark(ui.ctx(), !dark);
+                        }
+                    });
+                });
             });
-        self.show_config = open;
     }
 
-    fn save_agent_setup(&mut self) {
-        let Some(p) = &self.package else { return };
-        let bytes = match p.setup_with_config(&self.config_text) {
-            Ok(b) => b,
-            Err(e) => {
-                self.config_status = format!("{e:#}");
-                return;
+    fn device_list_item(&self, ui: &mut egui::Ui, r: &DeviceRow, selected: bool) -> egui::Response {
+        let pal = &self.pal;
+        let width = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, 40.0), egui::Sense::click());
+        if ui.is_rect_visible(rect) {
+            let p = ui.painter();
+            if selected {
+                p.rect_filled(rect, egui::Rounding::same(8.0), tint(pal.accent, 34));
+            } else if resp.hovered() {
+                p.rect_filled(rect, egui::Rounding::same(8.0), pal.surface2);
             }
+            let color = if r.online { pal.green } else { pal.text_faint };
+            let dot = egui::pos2(rect.left() + 12.0, rect.center().y);
+            if r.online {
+                p.circle_filled(dot, 6.0, tint(color, 45));
+            }
+            p.circle_filled(dot, 3.6, color);
+            p.text(
+                egui::pos2(rect.left() + 26.0, rect.top() + 12.0),
+                egui::Align2::LEFT_CENTER,
+                truncate(&r.host, 22),
+                semibold(13.0),
+                if r.online { pal.text } else { pal.text_dim },
+            );
+            let sub = if r.online {
+                match (r.cpu, r.user.is_empty()) {
+                    (Some(c), false) => format!("{} · {c:.0}% CPU", truncate(&r.user, 14)),
+                    (Some(c), true) => format!("{c:.0}% CPU"),
+                    _ => "online".into(),
+                }
+            } else {
+                format!("seen {}", w::fmt_ago(r.last_seen))
+            };
+            p.text(
+                egui::pos2(rect.left() + 26.0, rect.top() + 28.0),
+                egui::Align2::LEFT_CENTER,
+                sub,
+                egui::FontId::proportional(11.5),
+                pal.text_faint,
+            );
+            // Right-side markers
+            let mut x = rect.right() - 8.0;
+            if r.streaming {
+                let g = p.layout_no_wrap("LIVE".into(), semibold(9.5), pal.red);
+                let br = egui::Rect::from_min_size(
+                    egui::pos2(x - g.size().x - 8.0, rect.center().y - 8.0),
+                    vec2(g.size().x + 8.0, 16.0),
+                );
+                p.rect_filled(br, egui::Rounding::same(4.0), tint(pal.red, 40));
+                p.galley(br.center() - g.size() / 2.0, g, pal.red);
+                x = br.left() - 4.0;
+            }
+            if let Some(sev) = r.worst() {
+                if sev >= Severity::Warn {
+                    let c = if sev == Severity::Crit {
+                        pal.red
+                    } else {
+                        pal.amber
+                    };
+                    p.text(
+                        egui::pos2(x, rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        "⚠",
+                        egui::FontId::proportional(13.0),
+                        c,
+                    );
+                }
+            }
+        }
+        let tip = if r.alerts.is_empty() {
+            r.ips.join(", ")
+        } else {
+            r.alerts
+                .iter()
+                .map(|a| a.text.clone())
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name(format!("FleetViewAgent-Setup-{}.exe", p.version))
-            .add_filter("Program", &["exe"])
-            .save_file()
-        else {
+        if tip.is_empty() {
+            resp
+        } else {
+            resp.on_hover_text(tip)
+        }
+    }
+
+    fn status_bar(&mut self, ctx: &egui::Context, rows: &[DeviceRow]) {
+        let pal = self.pal;
+        let (listening, err, name, last_event) = {
+            let s = self.state.lock().unwrap();
+            (
+                s.listening,
+                s.listen_error.clone(),
+                s.master_name.clone(),
+                s.events.front().cloned(),
+            )
+        };
+        egui::TopBottomPanel::bottom("status")
+            .exact_height(28.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(pal.panel)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                    .inner_margin(egui::Margin::symmetric(12.0, 4.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    if listening {
+                        w::dot(ui, pal.green, true);
+                        ui.label(
+                            RichText::new(format!(
+                                "Listening on port {}",
+                                self.settings.control_port
+                            ))
+                            .size(12.0)
+                            .color(pal.text_dim),
+                        );
+                    } else {
+                        w::dot(ui, pal.red, true);
+                        ui.label(
+                            RichText::new(err.unwrap_or_else(|| "Not listening".into()))
+                                .size(12.0)
+                                .color(pal.red),
+                        );
+                    }
+                    ui.label(RichText::new(name).size(12.0).color(pal.text_faint));
+                    let online = rows.iter().filter(|r| r.online).count();
+                    ui.label(
+                        RichText::new(format!("{online} online · {} known", rows.len()))
+                            .size(12.0)
+                            .color(pal.text_faint),
+                    );
+                    match &self.package {
+                        Some(p) => ui.label(
+                            RichText::new(format!("Agent package {}", p.version))
+                                .size(12.0)
+                                .color(pal.text_faint),
+                        ),
+                        None => ui.label(
+                            RichText::new("No agent package")
+                                .size(12.0)
+                                .color(pal.amber),
+                        ),
+                    };
+                    if let Some((at, msg)) = last_event {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let r = ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!(
+                                        "{}  {}",
+                                        at.format("%H:%M:%S"),
+                                        truncate(&msg, 80)
+                                    ))
+                                    .size(12.0)
+                                    .color(pal.text_faint),
+                                )
+                                .sense(egui::Sense::click()),
+                            );
+                            if r.on_hover_text("Open the activity log").clicked() {
+                                self.go(Page::Activity);
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    fn draw_toasts(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        self.toasts.retain(|t| t.until > now);
+        if self.toasts.is_empty() {
             return;
-        };
-        self.config_status = match std::fs::write(&path, bytes) {
-            Ok(()) => format!(
-                "Saved {}. Keep it private: it contains the enrollment secret.",
-                path.display()
-            ),
-            Err(e) => format!("Cannot write {}: {e}", path.display()),
-        };
+        }
+        let pal = self.pal;
+        egui::Area::new(egui::Id::new("toasts"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, vec2(-18.0, -42.0))
+            .order(egui::Order::Tooltip)
+            .interactable(false)
+            .show(ctx, |ui| {
+                for t in &self.toasts {
+                    egui::Frame::none()
+                        .fill(pal.surface)
+                        .stroke(egui::Stroke::new(1.0_f32, pal.border))
+                        .rounding(egui::Rounding::same(10.0))
+                        .shadow(ctx.style().visuals.popup_shadow)
+                        .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                        .show(ui, |ui| {
+                            ui.set_min_width(260.0);
+                            ui.horizontal(|ui| {
+                                let (r, _) =
+                                    ui.allocate_exact_size(vec2(4.0, 18.0), egui::Sense::hover());
+                                ui.painter()
+                                    .rect_filled(r, egui::Rounding::same(2.0), t.color);
+                                ui.label(RichText::new(&t.text).color(pal.text));
+                            });
+                        });
+                    ui.add_space(6.0);
+                }
+            });
+        ctx.request_repaint_after(Duration::from_millis(200));
+    }
+
+    /// Small header used by every page: title, subtitle, and right-aligned
+    /// actions.
+    fn page_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        title: &str,
+        subtitle: &str,
+        actions: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
+        let pal = self.pal;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                w::heading(ui, &pal, title);
+                if !subtitle.is_empty() {
+                    w::subtle(ui, &pal, subtitle);
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                actions(self, ui);
+            });
+        });
+        ui.add_space(14.0);
+    }
+
+    fn version_text(&self, version: &str, update: UpdateState) -> RichText {
+        let text = if version.is_empty() { "—" } else { version };
+        match update {
+            UpdateState::Outdated => RichText::new(format!("{text} ⬆")).color(self.pal.amber),
+            UpdateState::Current => RichText::new(text).color(self.pal.green),
+            _ => RichText::new(text).color(self.pal.text_dim),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+pub fn row_matches(r: &DeviceRow, q: &str) -> bool {
+    r.host.to_lowercase().contains(q)
+        || r.user.to_lowercase().contains(q)
+        || r.ips.iter().any(|i| i.contains(q))
+        || r.os.to_lowercase().contains(q)
+        || r.tags.iter().any(|t| t.to_lowercase().contains(q))
+}
+
+/// "Microsoft Windows 11 Pro 10.0.22631" -> "Windows 11 Pro"
+pub fn short_os(os: &str) -> String {
+    let s = os.trim().trim_start_matches("Microsoft ").to_string();
+    // Drop a trailing build number.
+    match s.rsplit_once(' ') {
+        Some((head, tail))
+            if tail.contains('.')
+                && tail.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && !head.is_empty() =>
+        {
+            head.to_string()
+        }
+        _ => s,
+    }
+}
+
+pub fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
     }
 }
 
 fn split_args(s: &str) -> Vec<String> {
     s.split_whitespace().map(|x| x.to_string()).collect()
+}
+
+/// Quote a CSV field.
+pub fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 /// Quote a value as a PowerShell single-quoted string literal.
@@ -1630,5 +1628,21 @@ mod tests {
         let (exe, args) = split_command(r"C:\Program Files\App\uninstall.exe /x y");
         assert_eq!(exe, r"C:\Program Files\App\uninstall.exe");
         assert_eq!(args, "/x y");
+    }
+
+    #[test]
+    fn short_os_drops_vendor_and_build() {
+        assert_eq!(
+            short_os("Microsoft Windows 11 Pro 10.0.22631"),
+            "Windows 11 Pro"
+        );
+        assert_eq!(short_os("Windows 10 Pro"), "Windows 10 Pro");
+    }
+
+    #[test]
+    fn csv_quotes_when_needed() {
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("plain"), "plain");
     }
 }
