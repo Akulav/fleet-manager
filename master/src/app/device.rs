@@ -143,6 +143,55 @@ impl App {
             }
             ui.separator();
             if ui
+                .add_enabled(row.online, egui::Button::new("✏  Rename PC…"))
+                .clicked()
+            {
+                self.rename_input = row.host.clone();
+                self.composer = Some(Composer {
+                    kind: ComposerKind::Rename,
+                    ids: ids.clone(),
+                });
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    row.online && self.policy.admin_ready(),
+                    egui::Button::new("🔑  Set standard admin account"),
+                )
+                .on_disabled_hover_text("Set it up on the Standards page first")
+                .clicked()
+            {
+                self.confirm = Some(Action::SetAdmin { ids: ids.clone() });
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    row.online && self.policy.wallpaper_ready(),
+                    egui::Button::new("🖼  Set standard background"),
+                )
+                .on_disabled_hover_text("Set it up on the Standards page first")
+                .clicked()
+            {
+                self.confirm = Some(Action::Wallpaper { ids: ids.clone() });
+                ui.close_menu();
+            }
+            if ui
+                .add_enabled(
+                    row.online && !self.policy.apps.is_empty(),
+                    egui::Button::new("📦  Install app package"),
+                )
+                .on_disabled_hover_text("Set it up on the Standards page first")
+                .clicked()
+            {
+                self.confirm = Some(Action::InstallApps {
+                    apps: self.policy.apps.clone(),
+                    ids: ids.clone(),
+                    package: true,
+                });
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui
                 .add_enabled(
                     !row.online,
                     egui::Button::new(RichText::new("🗑  Remove from list").color(pal.red)),
@@ -536,15 +585,17 @@ impl App {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled(online, egui::Button::new("📂  Push installer file…"))
+                    .add_enabled(online, egui::Button::new("📂  Push installer files…"))
+                    .on_hover_text(
+                        "Pick one or more .exe / .msi; their silent switches are detected",
+                    )
                     .clicked()
                 {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Installers", &["exe", "msi"])
-                        .pick_file()
-                    {
-                        self.confirm = Some(Action::InstallFile {
-                            path: path.display().to_string(),
+                    self.install_queue.clear();
+                    self.add_installer_files_to_queue();
+                    if !self.install_queue.is_empty() {
+                        self.composer = Some(Composer {
+                            kind: ComposerKind::Install,
                             ids: vec![id.to_string()],
                         });
                     }

@@ -5,7 +5,10 @@
 mod agentpkg;
 mod app;
 mod demo;
+mod installer;
+mod packages;
 mod paths;
+mod policy;
 mod prefs;
 mod server;
 mod settings;

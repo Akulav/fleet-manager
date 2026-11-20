@@ -49,10 +49,18 @@ the LAN even when IP addresses change.
 - **Online vs. ever-seen** — the dashboard shows how many PCs are online now
   against the total number ever enrolled.
 - **Software inventory** — the installed-programs list from each machine.
-- **Remote install / uninstall** — push an installer (`.exe`/`.msi`) from the
-  master and run it **silently as admin**, or install from a URL. No more walking
-  to every desk to type your admin password for the next MSign update.
-  URL installs are **https-only**; runs time out after 60 minutes.
+- **Remote install / uninstall** — push one or **several installers at once**
+  (`.exe`/`.msi`) from the master and run them **silently as admin**, or install
+  from a URL. Silent switches are **detected per file** (MSI, Inno Setup, NSIS,
+  WiX bundle, InstallShield, Advanced Installer); installs run one after another
+  on each PC so MSIs never collide, and "restart required" (3010) counts as
+  success. Failed MSIs report the tail of their log. URL installs are
+  **https-only**; runs time out after 60 minutes.
+- **Standards** — one local admin account (same name + password on every PC,
+  optionally demoting every other local admin), one desktop background (for all
+  profiles and new users, optionally locked) and one app package. Each can be
+  kept applied **automatically**, so PCs that enroll later get it too. PCs can be
+  renamed one by one or from a pattern such as `ANSC-###`.
 - **PowerShell as admin** — run a script on one machine or **all online machines**
   at once (with a confirmation); output comes back to the console.
 - **Screenshots & live view** — capture the screen on demand or stream it. The

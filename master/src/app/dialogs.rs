@@ -72,15 +72,48 @@ impl App {
                 format!("Run on {n} PC(s)"),
                 n > 1,
             ),
-            Action::InstallFile { path, .. } => (
+            Action::InstallApps { apps, .. } => (
                 "Install software?".into(),
                 format!(
-                    "Push {} to {n} PC(s) and run it silently as SYSTEM{} with arguments “{}”.",
-                    std::path::Path::new(path).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
-                    if self.install_is_msi { " (MSI)" } else { "" },
-                    self.install_args
+                    "Push {} installer(s) to {n} PC(s) and run them silently as SYSTEM, one after another on each PC. \
+                     PCs that already have an app (by its “skip if installed” name) are skipped.",
+                    apps.len()
                 ),
                 format!("Install on {n} PC(s)"),
+                false,
+            ),
+            Action::Rename { restart, .. } => (
+                "Rename PCs?".into(),
+                format!(
+                    "Rename {n} PC(s) as listed below. The new name takes effect after a restart{}.",
+                    if *restart { " — they restart in 1 minute, with a warning to the user" } else { "" }
+                ),
+                format!("Rename {n} PC(s)"),
+                *restart,
+            ),
+            Action::SetAdmin { .. } => (
+                "Set the admin account?".into(),
+                format!(
+                    "Create (or reset the password of) the local admin “{}” on {n} PC(s) and add it to Administrators.{}",
+                    self.policy.admin_user.trim(),
+                    if self.policy.admin_demote_others {
+                        "\nEvery OTHER local account is removed from Administrators (it keeps working as a standard user)."
+                    } else {
+                        ""
+                    }
+                ),
+                format!("Apply to {n} PC(s)"),
+                self.policy.admin_demote_others,
+            ),
+            Action::Wallpaper { .. } => (
+                "Set the desktop background?".into(),
+                format!(
+                    "Set {} as the background of every user on {n} PC(s) ({}){}.",
+                    std::path::Path::new(&self.policy.wallpaper_path).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(),
+                    self.policy.wallpaper_style.label(),
+                    if self.policy.wallpaper_lock { ", locked so users can't change it" } else { "" }
+                ),
+                format!("Apply to {n} PC(s)"),
                 false,
             ),
             Action::InstallUrl { url, .. } => (
@@ -181,6 +214,20 @@ impl App {
                         });
                     ui.add_space(8.0);
                 }
+                if let Action::InstallApps { apps, .. } = &action {
+                    self.app_summary(ui, apps);
+                    ui.add_space(8.0);
+                }
+                if let Action::Rename { names, .. } = &action {
+                    let s = self.state.lock().unwrap();
+                    let list: Vec<(String, String)> = names
+                        .iter()
+                        .map(|(id, n)| (s.hostname_of(id), n.clone()))
+                        .collect();
+                    drop(s);
+                    self.rename_preview(ui, &list);
+                    ui.add_space(8.0);
+                }
                 w::card_title(ui, &pal, &format!("Target PCs ({n})"));
                 self.host_list(ui, &ids);
                 ui.add_space(14.0);
@@ -222,6 +269,7 @@ impl App {
             ComposerKind::Notify => "Message users",
             ComposerKind::Config => "Remote config",
             ComposerKind::Tags => "Edit tags",
+            ComposerKind::Rename => "Rename PCs",
         };
         let mut open = true;
         let mut next: Option<Action> = None;
@@ -280,52 +328,132 @@ impl App {
                         });
                     }
                     ComposerKind::Install => {
-                        egui::Grid::new("inst").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                            ui.label("Installer file");
-                            ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.install_path).hint_text("C:\\Installers\\setup.exe").desired_width(330.0));
-                                if ui.button("Browse…").clicked() {
-                                    if let Some(p) = rfd::FileDialog::new().add_filter("Installers", &["exe", "msi"]).pick_file() {
-                                        self.install_path = p.display().to_string();
-                                        if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("msi")) {
-                                            self.install_is_msi = true;
-                                            if self.install_args.trim() == "/S" {
-                                                self.install_args = "/qn /norestart".into();
-                                            }
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Installers").font(semibold(13.5)).color(pal.text));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .add_enabled(!self.policy.apps.is_empty(), egui::Button::new(format!("+ App package ({})", self.policy.apps.len())))
+                                    .on_hover_text("Add every app of the fleet's standard package (Standards page)")
+                                    .clicked()
+                                {
+                                    for a in self.policy.apps.clone() {
+                                        if !self.install_queue.iter().any(|q| q.path == a.path) {
+                                            self.install_queue.push(a);
                                         }
                                     }
                                 }
+                                if ui.button("📂  Add files…").clicked() {
+                                    self.add_installer_files_to_queue();
+                                }
                             });
-                            ui.end_row();
-                            ui.label("…or https URL");
-                            ui.add(egui::TextEdit::singleline(&mut self.url_input).hint_text("https://example.com/setup.exe").desired_width(400.0));
-                            ui.end_row();
-                            ui.label("Silent arguments");
-                            ui.horizontal(|ui| {
-                                ui.add(egui::TextEdit::singleline(&mut self.install_args).desired_width(150.0));
-                                ui.checkbox(&mut self.install_is_msi, "MSI package");
-                            });
-                            ui.end_row();
                         });
-                        w::faint(ui, &pal, "Typical: /S (NSIS) · /VERYSILENT /NORESTART (Inno) · /qn /norestart (MSI). Runs time out after 60 minutes.");
+                        ui.add_space(4.0);
+                        let mut queue = std::mem::take(&mut self.install_queue);
+                        self.app_list_editor(ui, &mut queue, "install_queue");
+                        self.install_queue = queue;
                         ui.add_space(10.0);
-                        let path = self.install_path.trim().to_string();
-                        let url = self.url_input.trim().to_string();
-                        let file_ok = !path.is_empty() && std::path::Path::new(&path).is_file();
-                        let url_ok = url.to_lowercase().starts_with("https://");
-                        if !path.is_empty() && !file_ok {
-                            ui.label(RichText::new("File not found").color(pal.red));
-                        }
-                        if !url.is_empty() && !url_ok {
-                            ui.label(RichText::new("URLs must start with https://").color(pal.red));
-                        }
+                        let files_ok = !self.install_queue.is_empty()
+                            && self.install_queue.iter().all(|a| std::path::Path::new(&a.path).is_file());
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if w::primary_enabled(ui, &pal, !ids.is_empty() && file_ok, "Push file…").clicked() {
-                                    next = Some(Action::InstallFile { path: path.clone(), ids: ids.clone() });
+                                let label = format!("Install {} app(s)…", self.install_queue.len());
+                                if w::primary_enabled(ui, &pal, !ids.is_empty() && files_ok, &label).clicked() {
+                                    next = Some(Action::InstallApps {
+                                        apps: self.install_queue.clone(),
+                                        ids: ids.clone(),
+                                        package: false,
+                                    });
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    close = true;
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new(RichText::new("Install from an https URL instead").color(pal.text_dim))
+                            .id_salt("inst_url")
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut self.url_input).hint_text("https://example.com/setup.msi").desired_width(300.0));
+                                    ui.add(egui::TextEdit::singleline(&mut self.install_args).desired_width(130.0))
+                                        .on_hover_text("Silent arguments");
+                                    ui.checkbox(&mut self.install_is_msi, "MSI");
+                                });
+                                let url = self.url_input.trim().to_string();
+                                let url_ok = url.to_lowercase().starts_with("https://");
+                                if !url.is_empty() && !url_ok {
+                                    ui.label(RichText::new("URLs must start with https://").color(pal.red));
                                 }
                                 if ui.add_enabled(!ids.is_empty() && url_ok, egui::Button::new("Install from URL…")).clicked() {
                                     next = Some(Action::InstallUrl { url: url.clone(), ids: ids.clone() });
+                                }
+                            });
+                    }
+                    ComposerKind::Rename => {
+                        let mut names: Vec<(String, String)> = Vec::new();
+                        let mut problems: Vec<String> = Vec::new();
+                        if ids.len() == 1 {
+                            ui.horizontal(|ui| {
+                                ui.label("New name");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.rename_input)
+                                        .hint_text("e.g. ANSC-012")
+                                        .char_limit(15)
+                                        .desired_width(220.0),
+                                );
+                            });
+                            let n = self.rename_input.trim().to_uppercase();
+                            match crate::policy::validate_pc_name(&n) {
+                                Ok(()) => names.push((ids[0].clone(), n)),
+                                Err(e) if !n.is_empty() => problems.push(e),
+                                Err(_) => {}
+                            }
+                        } else {
+                            egui::Grid::new("rename_grid").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                                ui.label("Pattern");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.policy.name_pattern)
+                                        .hint_text("ANSC-###")
+                                        .desired_width(220.0),
+                                );
+                                ui.end_row();
+                                ui.label("First number");
+                                ui.add(egui::DragValue::new(&mut self.policy.name_start).range(0..=99999));
+                                ui.end_row();
+                            });
+                            w::faint(ui, &pal, "Each run of # becomes a zero-padded number; PCs are numbered in their current name order.");
+                            let s = self.state.lock().unwrap();
+                            let mut sorted: Vec<(String, String)> = ids.iter().map(|i| (s.hostname_of(i).to_lowercase(), i.clone())).collect();
+                            drop(s);
+                            sorted.sort();
+                            for (k, (_, id)) in sorted.into_iter().enumerate() {
+                                let n = crate::policy::expand_pattern(&self.policy.name_pattern, self.policy.name_start + k as u32);
+                                if let Err(e) = crate::policy::validate_pc_name(&n) {
+                                    problems.push(e);
+                                }
+                                names.push((id, n));
+                            }
+                        }
+                        ui.checkbox(&mut self.policy.name_restart, "Restart in 1 minute to apply (users get a warning)");
+                        problems.dedup();
+                        for p in problems.iter().take(3) {
+                            ui.label(RichText::new(p).color(pal.red));
+                        }
+                        if !names.is_empty() {
+                            let s = self.state.lock().unwrap();
+                            let list: Vec<(String, String)> =
+                                names.iter().map(|(id, n)| (s.hostname_of(id), n.clone())).collect();
+                            drop(s);
+                            ui.add_space(6.0);
+                            self.rename_preview(ui, &list);
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let ok = !names.is_empty() && problems.is_empty();
+                                if w::primary_enabled(ui, &pal, ok, "Review & rename…").clicked() {
+                                    let _ = self.policy.save();
+                                    next = Some(Action::Rename { names: names.clone(), restart: self.policy.name_restart });
                                 }
                                 if ui.button("Cancel").clicked() {
                                     close = true;

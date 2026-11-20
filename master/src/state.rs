@@ -71,6 +71,8 @@ pub struct AgentView {
     pub last_macs: Vec<String>,
     pub last_os: String,
     pub last_user: Option<String>,
+    /// Fleet standards applied on this PC: key -> revision (see `policy`).
+    pub applied: BTreeMap<String, String>,
 }
 
 impl AgentView {
@@ -101,6 +103,7 @@ impl AgentView {
             last_macs: Vec::new(),
             last_os: String::new(),
             last_user: None,
+            applied: BTreeMap::new(),
         }
     }
 
@@ -118,6 +121,7 @@ impl AgentView {
         a.last_macs = known.macs.clone();
         a.last_os = known.os.clone();
         a.last_user = known.user.clone();
+        a.applied = known.applied.clone();
         a
     }
 
@@ -187,6 +191,7 @@ pub enum JobKind {
     Config,
     Notify,
     Power,
+    Standard,
 }
 
 impl JobKind {
@@ -199,6 +204,7 @@ impl JobKind {
             JobKind::Config => "Config",
             JobKind::Notify => "Message",
             JobKind::Power => "Power",
+            JobKind::Standard => "Standard",
         }
     }
 }
@@ -266,6 +272,8 @@ pub struct Shared {
     next_job_id: u64,
     /// command_id -> (job id, agent id)
     command_jobs: HashMap<String, (u64, String)>,
+    /// command_id -> (agent id, standard key, revision) to record on success.
+    command_marks: HashMap<String, (String, String, String)>,
 }
 
 impl Shared {
@@ -279,6 +287,7 @@ impl Shared {
             jobs: VecDeque::new(),
             next_job_id: 1,
             command_jobs: HashMap::new(),
+            command_marks: HashMap::new(),
         }
     }
 
@@ -333,6 +342,7 @@ impl Shared {
                 for t in old.targets {
                     if let Some(c) = t.command_id {
                         self.command_jobs.remove(&c);
+                        self.command_marks.remove(&c);
                     }
                 }
             }
@@ -369,11 +379,24 @@ impl Shared {
 
     /// Route a command result to its job, if it belongs to one.
     pub fn complete_command(&mut self, r: &CommandResult) {
+        let mark = self.command_marks.remove(&r.command_id);
         let Some((job, agent)) = self.command_jobs.remove(&r.command_id) else {
             return;
         };
+        // Older agents report "restart required" (3010 / 1641) as a failure.
+        let is_install = self
+            .jobs
+            .iter()
+            .find(|j| j.id == job)
+            .is_some_and(|j| matches!(j.kind, JobKind::Install | JobKind::Standard));
+        let success = r.success || (is_install && matches!(r.exit_code, Some(3010) | Some(1641)));
+        if success {
+            if let Some((a, key, rev)) = mark {
+                self.mark_applied(&a, &key, &rev);
+            }
+        }
         if let Some(t) = self.target_mut(job, &agent) {
-            t.status = if r.success {
+            t.status = if success {
                 TargetStatus::Succeeded
             } else {
                 TargetStatus::Failed
@@ -421,11 +444,42 @@ impl Shared {
         }
         for c in dropped {
             self.command_jobs.remove(&c);
+            self.command_marks.remove(&c);
         }
     }
 
     pub fn running_jobs(&self) -> usize {
         self.jobs.iter().filter(|j| j.is_running()).count()
+    }
+
+    pub fn target_status(&self, job: u64, agent: &str) -> Option<TargetStatus> {
+        self.jobs
+            .iter()
+            .find(|j| j.id == job)
+            .and_then(|j| j.targets.iter().find(|t| t.agent_id == agent))
+            .map(|t| t.status.clone())
+    }
+
+    /// Record `key` at `rev` on the agent when `command_id` succeeds.
+    pub fn mark_on_success(&mut self, command_id: &str, agent: &str, key: &str, rev: &str) {
+        self.command_marks.insert(
+            command_id.to_string(),
+            (agent.to_string(), key.to_string(), rev.to_string()),
+        );
+    }
+
+    /// Whether a standard is being applied to the agent right now.
+    pub fn mark_in_flight(&self, agent: &str, key: &str) -> bool {
+        self.command_marks
+            .values()
+            .any(|(a, k, _)| a == agent && k == key)
+    }
+
+    pub fn mark_applied(&mut self, agent: &str, key: &str, rev: &str) {
+        if let Some(a) = self.agents.get_mut(agent) {
+            a.applied.insert(key.to_string(), rev.to_string());
+            save_known(self);
+        }
     }
 }
 
@@ -451,6 +505,8 @@ pub struct KnownAgent {
     pub os: String,
     #[serde(default)]
     pub user: Option<String>,
+    #[serde(default)]
+    pub applied: BTreeMap<String, String>,
 }
 
 pub fn load_known() -> Vec<KnownAgent> {
@@ -476,6 +532,7 @@ pub fn save_known(state: &Shared) {
             macs: a.last_macs.clone(),
             os: a.last_os.clone(),
             user: a.last_user.clone(),
+            applied: a.applied.clone(),
         })
         .collect();
     if let Ok(text) = serde_json::to_string_pretty(&list) {
