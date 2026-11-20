@@ -12,6 +12,7 @@ mod devices;
 mod dialogs;
 mod jobs;
 mod software;
+mod standards;
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ use eframe::egui::{self, vec2, Color32, RichText};
 use fleetview_shared::protocol::{ConfigUpdate, MasterMsg, RunSpec};
 
 use crate::agentpkg::{self, AgentPackage, UpdateState};
+use crate::policy::{self, AppItem, Policy};
 use crate::prefs::Prefs;
 use crate::settings::MasterSettings;
 use crate::state::{JobKind, SharedState, TargetStatus};
@@ -35,6 +37,7 @@ pub enum Page {
     Software,
     Jobs,
     Activity,
+    Standards,
     Deploy,
     Device(String),
 }
@@ -107,8 +110,22 @@ pub enum Action {
         script: String,
         ids: Vec<String>,
     },
-    InstallFile {
-        path: String,
+    /// Push these installers to each PC, one after another.
+    InstallApps {
+        apps: Vec<AppItem>,
+        ids: Vec<String>,
+        /// Record them as the fleet's app package standard.
+        package: bool,
+    },
+    /// (agent id, new name) per PC.
+    Rename {
+        names: Vec<(String, String)>,
+        restart: bool,
+    },
+    SetAdmin {
+        ids: Vec<String>,
+    },
+    Wallpaper {
         ids: Vec<String>,
     },
     InstallUrl {
@@ -144,7 +161,9 @@ impl Action {
     fn ids(&self) -> Vec<String> {
         match self {
             Action::RunScript { ids, .. }
-            | Action::InstallFile { ids, .. }
+            | Action::InstallApps { ids, .. }
+            | Action::SetAdmin { ids }
+            | Action::Wallpaper { ids }
             | Action::InstallUrl { ids, .. }
             | Action::Update { ids }
             | Action::Power { ids, .. }
@@ -152,6 +171,7 @@ impl Action {
             | Action::Notify { ids, .. }
             | Action::Forget { ids } => ids.clone(),
             Action::Uninstall { targets, .. } => targets.iter().map(|t| t.0.clone()).collect(),
+            Action::Rename { names, .. } => names.iter().map(|t| t.0.clone()).collect(),
         }
     }
 }
@@ -164,6 +184,7 @@ pub enum ComposerKind {
     Notify,
     Config,
     Tags,
+    Rename,
 }
 
 pub struct Composer {
@@ -258,7 +279,18 @@ pub struct App {
     install_args: String,
     install_is_msi: bool,
     url_input: String,
-    install_path: String,
+    /// Installers queued in the Install composer.
+    install_queue: Vec<AppItem>,
+    rename_input: String,
+
+    // Fleet standards
+    policy: Policy,
+    admin_pw_confirm: String,
+    show_pw: bool,
+    standards_status: String,
+    /// (agent id, standard key) -> last automatic attempt.
+    auto_attempts: HashMap<(String, String), Instant>,
+    last_auto_check: Instant,
     stream_fps: u32,
     tag_input: String,
     activity_filter: String,
@@ -344,6 +376,7 @@ impl App {
         let config_text = settings
             .agent_config_json(None)
             .unwrap_or_else(|e| format!("error: {e}"));
+        let policy = Policy::load();
         let mut app = Self {
             state,
             settings,
@@ -373,7 +406,14 @@ impl App {
             install_args: "/S".into(),
             install_is_msi: false,
             url_input: String::new(),
-            install_path: String::new(),
+            install_queue: Vec::new(),
+            rename_input: String::new(),
+            admin_pw_confirm: policy.admin_password.clone(),
+            policy,
+            show_pw: false,
+            standards_status: String::new(),
+            auto_attempts: HashMap::new(),
+            last_auto_check: Instant::now(),
             stream_fps: 2,
             tag_input: String::new(),
             activity_filter: String::new(),
@@ -403,6 +443,7 @@ impl App {
                     }
                     "jobs" => Page::Jobs,
                     "activity" => Page::Activity,
+                    "standards" => Page::Standards,
                     "deploy" => Page::Deploy,
                     "device" => Page::Device("demo-01".into()),
                     _ => Page::Dashboard,
@@ -675,6 +716,23 @@ impl App {
         ids: &[String],
         make: impl Fn(String) -> MasterMsg,
     ) -> u64 {
+        self.dispatch_tracked(kind, title, detail, ids, make, None, false)
+    }
+
+    /// [`Self::dispatch`], optionally recording a fleet standard (`key` at
+    /// `rev`) on each PC whose command succeeds; `quiet` skips the toast
+    /// (automatic runs).
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_tracked(
+        &mut self,
+        kind: JobKind,
+        title: String,
+        detail: String,
+        ids: &[String],
+        make: impl Fn(String) -> MasterMsg,
+        mark: Option<(&str, &str)>,
+        quiet: bool,
+    ) -> u64 {
         let mut s = self.state.lock().unwrap();
         let job = s.create_job(kind, title.clone(), detail, ids);
         let mut sent = 0;
@@ -683,6 +741,9 @@ impl App {
             let ok = s.agents.get(id).is_some_and(|a| a.send(make(cid.clone())));
             if ok {
                 s.attach_command(job, id, &cid);
+                if let Some((key, rev)) = mark {
+                    s.mark_on_success(&cid, id, key, rev);
+                }
                 sent += 1;
             } else {
                 s.finish_target(job, id, TargetStatus::Skipped, "offline — not sent");
@@ -690,8 +751,224 @@ impl App {
         }
         s.log(format!("{title}: sent to {sent} of {} PC(s)", ids.len()));
         drop(s);
-        self.toast(format!("{title} → {sent} PC(s)"));
+        if !quiet {
+            self.toast(format!("{title} → {sent} PC(s)"));
+        }
         job
+    }
+
+    /// Set the standard local admin account on `ids`.
+    fn apply_admin(&mut self, ids: &[String], quiet: bool) {
+        if !self.policy.admin_ready() || ids.is_empty() {
+            return;
+        }
+        let user = self.policy.admin_user.trim().to_string();
+        let script = policy::admin_script(
+            &user,
+            &self.policy.admin_password,
+            self.policy.admin_demote_others,
+        );
+        let rev = self.policy.admin_rev.to_string();
+        self.dispatch_tracked(
+            JobKind::Standard,
+            format!("Admin account: {user}"),
+            format!(
+                "Create/reset local admin “{user}” (password hidden){}",
+                if self.policy.admin_demote_others {
+                    "; remove other local accounts from Administrators"
+                } else {
+                    ""
+                }
+            ),
+            ids,
+            |cid| MasterMsg::RunPowerShell {
+                command_id: cid,
+                script: script.clone(),
+            },
+            Some((policy::KEY_ADMIN, &rev)),
+            quiet,
+        );
+    }
+
+    /// Set the standard desktop background on `ids`. The image is shrunk to
+    /// at most 4K and re-encoded as JPEG, since it travels inside the script
+    /// once per PC.
+    fn apply_wallpaper(&mut self, ids: &[String], quiet: bool) {
+        if ids.is_empty() {
+            return;
+        }
+        let path = self.policy.wallpaper_path.clone();
+        let image = match wallpaper_jpeg(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.toast_err(format!("Background image: {e}"));
+                return;
+            }
+        };
+        let script = policy::wallpaper_script(
+            &image,
+            "jpg",
+            self.policy.wallpaper_style,
+            self.policy.wallpaper_lock,
+        );
+        let rev = self.policy.wallpaper_rev.to_string();
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        self.dispatch_tracked(
+            JobKind::Standard,
+            format!("Desktop background: {}", truncate(&name, 36)),
+            format!(
+                "{path} ({}{})",
+                self.policy.wallpaper_style.label(),
+                if self.policy.wallpaper_lock {
+                    ", locked"
+                } else {
+                    ""
+                }
+            ),
+            ids,
+            |cid| MasterMsg::RunPowerShell {
+                command_id: cid,
+                script: script.clone(),
+            },
+            Some((policy::KEY_WALLPAPER, &rev)),
+            quiet,
+        );
+    }
+
+    fn rename_pcs(&mut self, names: Vec<(String, String)>, restart: bool) {
+        let ids: Vec<String> = names.iter().map(|n| n.0.clone()).collect();
+        let mut s = self.state.lock().unwrap();
+        let title = if names.len() == 1 {
+            format!("Rename to {}", names[0].1)
+        } else {
+            format!("Rename {} PCs", names.len())
+        };
+        let detail = names
+            .iter()
+            .map(|(id, n)| format!("{} → {n}", s.hostname_of(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let job = s.create_job(JobKind::Standard, title, detail, &ids);
+        let mut sent = 0;
+        for (id, name) in &names {
+            let cid = Self::new_command_id();
+            let ok = s.agents.get(id).is_some_and(|a| {
+                a.send(MasterMsg::RunPowerShell {
+                    command_id: cid.clone(),
+                    script: policy::rename_script(name, restart),
+                })
+            });
+            if ok {
+                s.attach_command(job, id, &cid);
+                sent += 1;
+            } else {
+                s.finish_target(job, id, TargetStatus::Skipped, "offline — not sent");
+            }
+        }
+        s.log(format!("rename sent to {sent} PC(s)"));
+        drop(s);
+        self.toast(format!("Renaming {sent} PC(s)"));
+    }
+
+    /// Fleet standards that are switched to automatic are applied to every
+    /// online PC that doesn't have the current version yet — including PCs
+    /// that enroll later. A failed attempt is retried after 30 minutes.
+    fn auto_apply(&mut self) {
+        if self.last_auto_check.elapsed() < Duration::from_secs(10) {
+            return;
+        }
+        self.last_auto_check = Instant::now();
+        let p = &self.policy;
+        let admin = p.admin_auto && p.admin_ready();
+        let wall = p.wallpaper_auto && p.wallpaper_ready();
+        let apps: Vec<(AppItem, String)> = if p.apps_auto {
+            p.apps
+                .iter()
+                .filter_map(|a| a.revision().map(|r| (a.clone(), r)))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !admin && !wall && apps.is_empty() {
+            return;
+        }
+        let admin_rev = p.admin_rev.to_string();
+        let wall_rev = p.wallpaper_rev.to_string();
+
+        let mut need_admin = Vec::new();
+        let mut need_wall = Vec::new();
+        let mut need_apps: Vec<(String, Vec<AppItem>)> = Vec::new();
+        {
+            let s = self.state.lock().unwrap();
+            for a in s.agents.values() {
+                if !a.online || a.tx.is_none() || a.telemetry.is_none() {
+                    continue;
+                }
+                let id = &a.agent_id;
+                let due = |key: &str, rev: &str| {
+                    a.applied.get(key).map(String::as_str) != Some(rev)
+                        && !s.mark_in_flight(id, key)
+                };
+                if admin && due(policy::KEY_ADMIN, &admin_rev) {
+                    need_admin.push(id.clone());
+                }
+                if wall && due(policy::KEY_WALLPAPER, &wall_rev) {
+                    need_wall.push(id.clone());
+                }
+                // Wait for the software list so installed apps are skipped.
+                if !apps.is_empty() && !a.software.is_empty() {
+                    let missing: Vec<AppItem> = apps
+                        .iter()
+                        .filter(|(app, rev)| due(&app.key(), rev))
+                        .map(|(app, _)| app.clone())
+                        .collect();
+                    if !missing.is_empty() {
+                        need_apps.push((id.clone(), missing));
+                    }
+                }
+            }
+        }
+        let now = Instant::now();
+        let mut attempt = |id: &str, key: &str| -> bool {
+            let k = (id.to_string(), key.to_string());
+            match self.auto_attempts.get(&k) {
+                Some(t) if now.duration_since(*t) < Duration::from_secs(30 * 60) => false,
+                _ => {
+                    self.auto_attempts.insert(k, now);
+                    true
+                }
+            }
+        };
+        let need_admin: Vec<String> = need_admin
+            .into_iter()
+            .filter(|id| attempt(id, policy::KEY_ADMIN))
+            .collect();
+        let need_wall: Vec<String> = need_wall
+            .into_iter()
+            .filter(|id| attempt(id, policy::KEY_WALLPAPER))
+            .collect();
+        let need_apps: Vec<(String, Vec<AppItem>)> = need_apps
+            .into_iter()
+            .filter_map(|(id, list)| {
+                let list: Vec<AppItem> = list
+                    .into_iter()
+                    .filter(|a| attempt(&id, &a.key()))
+                    .collect();
+                (!list.is_empty()).then_some((id, list))
+            })
+            .collect();
+        if !need_admin.is_empty() {
+            self.apply_admin(&need_admin, true);
+        }
+        if !need_wall.is_empty() {
+            self.apply_wallpaper(&need_wall, true);
+        }
+        for (id, list) in need_apps {
+            self.push_apps(list, vec![id], JobKind::Standard, true, true);
+        }
     }
 
     fn run_script(&mut self, script: String, ids: &[String]) -> u64 {
@@ -729,102 +1006,49 @@ impl App {
         self.toast(format!("Updating {n} agent(s) to {version}"));
     }
 
-    /// Stream a local installer/file to each listed agent and run it. The file
-    /// is read once; each agent gets its own transfer, a few at a time.
-    fn push_file_to(&mut self, path: std::path::PathBuf, ids: Vec<String>) {
-        let args = split_args(&self.install_args);
-        let is_msi = self.install_is_msi
-            || path
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("msi"));
-        let file_name = path
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "installer.exe".into());
-        let job = {
+    /// Push installers to PCs: one job per installer, installed one after
+    /// another on each PC (so MSIs never collide), all PCs in parallel.
+    /// With `track`, each install is recorded as part of the app package
+    /// standard.
+    fn push_apps(
+        &mut self,
+        apps: Vec<AppItem>,
+        ids: Vec<String>,
+        kind: JobKind,
+        track: bool,
+        quiet: bool,
+    ) {
+        if apps.is_empty() || ids.is_empty() {
+            return;
+        }
+        let jobs: Vec<u64> = {
             let mut s = self.state.lock().unwrap();
-            s.create_job(
-                JobKind::Install,
-                format!("Install {file_name}"),
-                path.display().to_string(),
-                &ids,
-            )
+            apps.iter()
+                .map(|a| {
+                    s.create_job(
+                        kind,
+                        format!("Install {}", truncate(&a.file_name(), 40)),
+                        format!("{}  {}", a.path, a.args),
+                        &ids,
+                    )
+                })
+                .collect()
         };
-        self.toast(format!("Pushing {file_name} to {} PC(s)", ids.len()));
-        let state = self.state.clone();
-        std::thread::spawn(move || {
-            let data = match std::fs::read(&path) {
-                Ok(d) => std::sync::Arc::new(d),
-                Err(e) => {
-                    if let Ok(mut s) = state.lock() {
-                        s.log(format!("cannot read {}: {e}", path.display()));
-                        for id in &ids {
-                            s.finish_target(
-                                job,
-                                id,
-                                TargetStatus::Failed,
-                                &format!("cannot read file: {e}"),
-                            );
-                        }
-                    }
-                    return;
-                }
-            };
-            let queue =
-                std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(ids)));
-            let mut workers = Vec::new();
-            for _ in 0..4 {
-                let (queue, state, data, file_name, args) = (
-                    queue.clone(),
-                    state.clone(),
-                    data.clone(),
-                    file_name.clone(),
-                    args.clone(),
-                );
-                workers.push(std::thread::spawn(move || loop {
-                    let Some(id) = queue.lock().unwrap().pop_front() else {
-                        break;
-                    };
-                    let run = RunSpec {
-                        command_id: App::new_command_id(),
-                        args: args.clone(),
-                        is_msi,
-                    };
-                    if let Ok(mut s) = state.lock() {
-                        s.attach_command(job, &id, &run.command_id);
-                    }
-                    // Waits for the agent's acks before taking the next PC, so
-                    // memory stays bounded however big the fleet is.
-                    let outcome = agentpkg::send_file_and_wait(
-                        &state,
-                        &id,
-                        App::new_command_id(),
-                        file_name.clone(),
-                        &data,
-                        Some(run),
-                    );
-                    if outcome != agentpkg::SendOutcome::Delivered {
-                        if let Ok(mut s) = state.lock() {
-                            let host = s.hostname_of(&id);
-                            let note = format!("{file_name} not delivered ({outcome:?})");
-                            s.log(format!("{host}: {note}"));
-                            let status = if outcome == agentpkg::SendOutcome::Offline {
-                                TargetStatus::Skipped
-                            } else {
-                                TargetStatus::Failed
-                            };
-                            s.finish_target(job, &id, status, &note);
-                        }
-                    }
-                }));
-            }
-            for w in workers {
-                let _ = w.join();
-            }
-            if let Ok(mut s) = state.lock() {
-                s.log(format!("installer {file_name} pushed"));
-            }
-        });
+        if !quiet {
+            self.toast(format!(
+                "Installing {} app(s) on {} PC(s)",
+                apps.len(),
+                ids.len()
+            ));
+        }
+        crate::packages::start(
+            self.state.clone(),
+            apps,
+            jobs,
+            ids,
+            track,
+            App::new_command_id,
+        );
     }
 
     fn install_url_on(&mut self, url: String, ids: &[String]) {
@@ -973,9 +1197,12 @@ impl App {
                     self.selected_job = Some(job);
                 }
             }
-            Action::InstallFile { path, ids } => {
-                self.push_file_to(std::path::PathBuf::from(path), ids)
+            Action::InstallApps { apps, ids, package } => {
+                self.push_apps(apps, ids, JobKind::Install, package, false)
             }
+            Action::Rename { names, restart } => self.rename_pcs(names, restart),
+            Action::SetAdmin { ids } => self.apply_admin(&ids, false),
+            Action::Wallpaper { ids } => self.apply_wallpaper(&ids, false),
             Action::InstallUrl { url, ids } => self.install_url_on(url, &ids),
             Action::Update { ids } => self.update_agents(ids),
             Action::Power { kind, ids } => {
@@ -1046,6 +1273,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(250));
 
         self.shortcuts(ctx);
+        self.auto_apply();
         let rows = self.snapshot();
 
         self.sidebar(ctx, &rows);
@@ -1062,6 +1290,7 @@ impl eframe::App for App {
                 Page::Software => self.page_software(ui, &rows),
                 Page::Jobs => self.page_jobs(ui),
                 Page::Activity => self.page_activity(ui),
+                Page::Standards => self.page_standards(ui, &rows),
                 Page::Deploy => self.page_deploy(ui),
                 Page::Device(id) => self.page_device(ui, &id, &rows),
             });
@@ -1153,7 +1382,7 @@ impl App {
                 let on_device = matches!(self.page, Page::Device(_));
 
                 type NavItem<'a> = (&'a str, &'a str, Page, Option<(String, Color32)>);
-                let items: [NavItem; 6] = [
+                let items: [NavItem; 7] = [
                     (
                         "🏠",
                         "Dashboard",
@@ -1174,6 +1403,7 @@ impl App {
                         (running > 0).then(|| (format!("{running} running"), pal.blue)),
                     ),
                     ("📜", "Activity", Page::Activity, None),
+                    ("📐", "Standards", Page::Standards, None),
                     ("🚀", "Deploy & settings", Page::Deploy, None),
                 ];
                 for (icon, label, page, badge) in items {
@@ -1512,6 +1742,29 @@ pub fn truncate(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
+}
+
+/// Read a wallpaper image, shrink it to fit 3840×2160 and re-encode it as a
+/// JPEG (quality 90) — a few hundred KB to ~2 MB, whatever the source was.
+fn wallpaper_jpeg(path: &str) -> Result<Vec<u8>, String> {
+    let meta = std::fs::metadata(path).map_err(|e| format!("{path}: {e}"))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err("the image file is larger than 64 MB".into());
+    }
+    let img = image::open(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let img = if img.width() > 3840 || img.height() > 2160 {
+        img.resize(3840, 2160, image::imageops::FilterType::Lanczos3)
+    } else {
+        img
+    };
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90)
+        .encode_image(&img.to_rgb8())
+        .map_err(|e| format!("cannot encode: {e}"))?;
+    if out.len() as u64 > policy::MAX_WALLPAPER_BYTES {
+        return Err("the image is too large even after compression".into());
+    }
+    Ok(out)
 }
 
 fn split_args(s: &str) -> Vec<String> {

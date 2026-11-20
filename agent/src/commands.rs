@@ -150,7 +150,12 @@ async fn download(url: reqwest::Url, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Execute a file per its [`RunSpec`] and capture output.
+/// Only one installer runs at a time on a PC. Windows Installer refuses a
+/// second concurrent MSI (error 1618) and many EXE installers wrap an MSI, so
+/// a fleet push of several packages queues here instead of failing.
+static INSTALL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Execute a file per its [`RunSpec`].
 pub async fn run_file(path: &Path, run: &RunSpec) -> CommandResult {
     audit(&format!(
         "run_file [{}]: {} {:?} (msi={})",
@@ -159,17 +164,129 @@ pub async fn run_file(path: &Path, run: &RunSpec) -> CommandResult {
         run.args,
         run.is_msi
     ));
+    // The agent's own self-update keeps its captured output and never waits
+    // behind a (possibly hung) installer.
+    if !run.is_msi && run.args.first().is_some_and(|a| a == "update") {
+        let mut c = Command::new(path);
+        c.args(&run.args);
+        return run_captured(&run.command_id, c, RUN_TIMEOUT).await;
+    }
+
+    let _queue = INSTALL_LOCK.lock().await;
+    let log_path = path.with_extension("install.log");
     let cmd = if run.is_msi {
         let mut c = Command::new("msiexec.exe");
         c.arg("/i").arg(path);
         c.args(&run.args);
+        if !run.args.iter().any(|a| a.to_lowercase().starts_with("/l")) {
+            c.arg("/L*v").arg(&log_path);
+        }
         c
     } else {
         let mut c = Command::new(path);
         c.args(&run.args);
         c
     };
-    run_captured(&run.command_id, cmd, RUN_TIMEOUT).await
+    let mut result = run_installer(&run.command_id, cmd, RUN_TIMEOUT).await;
+    if run.is_msi && !result.success {
+        if let Some(tail) = read_log_tail(&log_path, 40) {
+            result.stdout.push_str("\n--- end of the MSI log ---\n");
+            result.stdout.push_str(&tail);
+        }
+    }
+    result
+}
+
+/// Run an installer without capturing its output pipes.
+///
+/// Installers rarely print anything, but they often start a service, tray
+/// app or updater that inherits stdout/stderr. Waiting for those pipes to
+/// close (as `wait_with_output` does) then blocks until the 60-minute
+/// timeout even though the installer itself finished long ago — so only the
+/// process exit is awaited here.
+async fn run_installer(command_id: &str, mut cmd: Command, timeout: Duration) -> CommandResult {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return fail(command_id, &format!("could not start the installer: {e}")),
+    };
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let code = status.code();
+            let (success, meaning) = installer_exit_meaning(code);
+            CommandResult {
+                command_id: command_id.to_string(),
+                success,
+                exit_code: code,
+                stdout: match code {
+                    Some(c) => format!("installer exited with code {c}: {meaning}"),
+                    None => "installer ended without an exit code".into(),
+                },
+                stderr: String::new(),
+            }
+        }
+        Ok(Err(e)) => fail(command_id, &format!("wait: {e}")),
+        Err(_) => fail(
+            command_id,
+            &format!(
+                "timed out after {} min and was killed — the installer is probably waiting \
+                 for input on a hidden window: check its silent switches",
+                timeout.as_secs() / 60
+            ),
+        ),
+    }
+}
+
+/// Whether an installer exit code means success, plus a short explanation.
+/// Covers Windows Installer codes, which most EXE wrappers pass through.
+pub fn installer_exit_meaning(code: Option<i32>) -> (bool, &'static str) {
+    match code {
+        Some(0) => (true, "success"),
+        Some(3010) => (true, "success — a restart is needed to finish"),
+        Some(1641) => (true, "success — the installer started a restart"),
+        Some(1602) => (
+            false,
+            "cancelled (the installer showed UI that was dismissed)",
+        ),
+        Some(1603) => (false, "fatal error during installation (see the MSI log)"),
+        Some(1618) => (false, "another installation is already in progress"),
+        Some(1619) => (false, "the package could not be opened"),
+        Some(1620) => (false, "the package is not a valid MSI"),
+        Some(1625) => (false, "blocked by system policy"),
+        Some(1633) => (
+            false,
+            "this package does not support this platform (32/64-bit)",
+        ),
+        Some(1638) => (
+            false,
+            "another version of this product is already installed",
+        ),
+        Some(1639) => (false, "invalid command-line arguments"),
+        Some(1) | Some(2) => (false, "generic failure — often wrong silent arguments"),
+        Some(_) => (false, "failed"),
+        None => (false, "killed"),
+    }
+}
+
+/// Last `lines` lines of an installer log (MSI logs are UTF-16 LE).
+fn read_log_tail(path: &Path, lines: usize) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let text = if bytes.starts_with(&[0xFF, 0xFE]) {
+        let units: Vec<u16> = bytes[2..]
+            .chunks(2)
+            .filter(|c| c.len() == 2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    Some(all[start..].join("\n"))
 }
 
 /// Spawn `cmd`, wait (bounded by `timeout`) and capture its output.
@@ -363,6 +480,15 @@ mod tests {
         assert_eq!(sanitize("a/b/setup?.msi"), "setup_.msi");
         assert_eq!(sanitize(".."), "file.bin");
         assert_eq!(sanitize(""), "file.bin");
+    }
+
+    #[test]
+    fn reboot_required_counts_as_success() {
+        assert!(installer_exit_meaning(Some(0)).0);
+        assert!(installer_exit_meaning(Some(3010)).0);
+        assert!(installer_exit_meaning(Some(1641)).0);
+        assert!(!installer_exit_meaning(Some(1603)).0);
+        assert!(!installer_exit_meaning(None).0);
     }
 
     #[test]

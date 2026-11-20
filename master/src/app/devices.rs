@@ -511,6 +511,42 @@ impl App {
                     if ui.add_enabled(any, egui::Button::new("⚙  Config")).clicked() {
                         self.composer = Some(Composer { kind: ComposerKind::Config, ids: online.clone() });
                     }
+                    if ui.add_enabled(any, egui::Button::new("✏  Rename")).clicked() {
+                        self.rename_input.clear();
+                        self.composer = Some(Composer { kind: ComposerKind::Rename, ids: online.clone() });
+                    }
+                    ui.add_enabled_ui(any, |ui| {
+                        ui.menu_button("📐  Standards", |ui| {
+                            if ui
+                                .add_enabled(self.policy.admin_ready(), egui::Button::new("🔑  Set admin account"))
+                                .on_disabled_hover_text("Set it up on the Standards page first")
+                                .clicked()
+                            {
+                                self.confirm = Some(Action::SetAdmin { ids: online.clone() });
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(self.policy.wallpaper_ready(), egui::Button::new("🖼  Set background"))
+                                .on_disabled_hover_text("Set it up on the Standards page first")
+                                .clicked()
+                            {
+                                self.confirm = Some(Action::Wallpaper { ids: online.clone() });
+                                ui.close_menu();
+                            }
+                            if ui
+                                .add_enabled(!self.policy.apps.is_empty(), egui::Button::new("📦  Install app package"))
+                                .on_disabled_hover_text("Set it up on the Standards page first")
+                                .clicked()
+                            {
+                                self.confirm = Some(Action::InstallApps {
+                                    apps: self.policy.apps.clone(),
+                                    ids: online.clone(),
+                                    package: true,
+                                });
+                                ui.close_menu();
+                            }
+                        });
+                    });
                     if ui
                         .add_enabled(!offline.is_empty(), egui::Button::new("🗑  Remove"))
                         .on_hover_text("Forget the selected offline PCs (they re-appear if they connect again)")

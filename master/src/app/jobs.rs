@@ -346,5 +346,6 @@ fn kind_color(pal: &crate::ui::theme::Palette, k: JobKind) -> egui::Color32 {
         JobKind::Config => pal.blue,
         JobKind::Notify => pal.amber,
         JobKind::Power => pal.red,
+        JobKind::Standard => pal.violet,
     }
 }
