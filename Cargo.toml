@@ -1,14 +1,14 @@
 # FleetView — self-hosted fleet management for Windows LANs
-# Made by Akulav. Licensed MIT.
+# Made by Akulav. Source-available under the Akulav Source-Available License (see LICENSE).
 [workspace]
 resolver = "2"
 members = ["shared", "agent", "master"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 authors = ["Akulav"]
-license = "MIT"
+license-file = "LICENSE"
 repository = "https://github.com/Akulav/fleet-manager"
 
 [workspace.dependencies]

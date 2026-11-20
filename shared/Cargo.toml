@@ -3,7 +3,7 @@ name = "fleetview-shared"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [lib]
 name = "fleetview_shared"

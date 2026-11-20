@@ -13,7 +13,7 @@ fn main() {
             res.set("ProductName", "FleetView Agent");
             res.set("FileDescription", "FleetView Agent (Made by Akulav)");
             res.set("CompanyName", "Akulav");
-            res.set("LegalCopyright", "Licensed MIT");
+            res.set("LegalCopyright", "© 2026 Akulav. Source-available license.");
             let _ = res.compile();
         }
         println!("cargo:rerun-if-changed=../installer/assets/agent.ico");

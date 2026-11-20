@@ -3,7 +3,7 @@ name = "fleetview-master"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "FleetView master — fleet management desktop app. Made by Akulav."
 
 [[bin]]

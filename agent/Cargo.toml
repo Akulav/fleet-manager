@@ -3,7 +3,7 @@ name = "fleetview-agent"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
-license.workspace = true
+license-file.workspace = true
 description = "FleetView agent — Windows service + tray helper. Made by Akulav."
 
 [[bin]]

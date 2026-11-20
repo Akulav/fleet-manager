@@ -333,7 +333,21 @@ fn sanitize(name: &str) -> String {
         .collect();
     let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ').to_string();
     if cleaned.is_empty() {
-        "file.bin".into()
+        return "file.bin".into();
+    }
+    // Windows device names (CON, NUL, COM1, ...) can't be created as files, even
+    // with an extension, so "nul.exe" would fail the push in a confusing way.
+    let stem = cleaned
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("_{cleaned}")
     } else {
         cleaned
     }
@@ -363,6 +377,9 @@ mod tests {
         assert_eq!(sanitize("a/b/setup?.msi"), "setup_.msi");
         assert_eq!(sanitize(".."), "file.bin");
         assert_eq!(sanitize(""), "file.bin");
+        assert_eq!(sanitize("nul.exe"), "_nul.exe");
+        assert_eq!(sanitize("COM1"), "_COM1");
+        assert_eq!(sanitize("console.exe"), "console.exe");
     }
 
     #[test]

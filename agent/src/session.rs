@@ -194,9 +194,11 @@ fn launch_helper_in_session(
         let mut cmdline: Vec<u16> = cmd.encode_utf16().chain(std::iter::once(0)).collect();
 
         let mut desktop: Vec<u16> = "winsta0\\default\0".encode_utf16().collect();
-        let mut si = STARTUPINFOW::default();
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        si.lpDesktop = PWSTR(desktop.as_mut_ptr());
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop.as_mut_ptr()),
+            ..Default::default()
+        };
 
         let mut pi = PROCESS_INFORMATION::default();
 

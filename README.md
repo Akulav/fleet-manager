@@ -1,16 +1,36 @@
 <div align="center">
 
+<img src="installer/assets/logo.png" alt="FleetView" width="128" height="128">
+
 # FleetView
 
-**Self-hosted fleet management for Windows LANs — no cloud, no server required.**
+**Self-hosted fleet management for Windows LANs, made by Akulav.**
 
-Made by **Akulav** · Licensed under the [MIT License](LICENSE)
+No cloud. No server to run. The master is a desktop app on your own PC, and agents find it on the LAN even when its address changes.
+
+[![Latest release](https://img.shields.io/github/v/release/Akulav/fleet-manager?style=for-the-badge&label=release&color=e5383b)](https://github.com/Akulav/fleet-manager/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/Akulav/fleet-manager/total?style=for-the-badge&color=f4b740)](https://github.com/Akulav/fleet-manager/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/Akulav/fleet-manager/ci.yml?branch=main&style=for-the-badge&label=build)](https://github.com/Akulav/fleet-manager/actions/workflows/ci.yml)
+
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D6?style=flat-square&logo=windows&logoColor=white)
+![Rust](https://img.shields.io/badge/made%20with-Rust-B7410E?style=flat-square&logo=rust&logoColor=white)
+![LAN only](https://img.shields.io/badge/cloud-none-2ea44f?style=flat-square)
+![License](https://img.shields.io/badge/license-source--available-5c6270?style=flat-square)
+
+[Quick start](#-quick-start) ·
+[Setup guide](docs/SETUP.md) ·
+[Security model](docs/SECURITY.md) ·
+[Architecture](docs/ARCHITECTURE.md)
+
+### [⬇ Download the latest release](https://github.com/Akulav/fleet-manager/releases/latest)
 
 </div>
 
+---
+
 FleetView is a lightweight master/agent system for managing a fleet of Windows
 PCs on a local network. It was built for the case where you administer dozens of
-machines by hand and are **not allowed to run your own servers** — the master is
+machines by hand and are **not allowed to run your own servers**: the master is
 just a desktop app you run on your own PC, and agents find it automatically over
 the LAN even when IP addresses change.
 
@@ -19,9 +39,7 @@ the LAN even when IP addresses change.
 > your users it is installed. The agent is intentionally **visible** (tray icon +
 > logon splash) and every remote command is written to a local audit log.
 
----
-
-## Features
+## ✨ Features
 
 - **Auto-discovery** — agents locate the master via signed UDP broadcasts, so the
   master's IP can change freely. A fixed address and extra subnets are also
@@ -57,7 +75,7 @@ the LAN even when IP addresses change.
 - **Localized** — the master app is **English**; the agent tray/splash default to
   **Romanian**.
 
-### Master app
+### 🖥️ The master app
 
 - **Dashboard** — online/known PCs, PCs needing attention, outdated agents and
   running jobs at a glance, plus fleet CPU/memory/disk averages, the busiest PCs,
@@ -83,7 +101,7 @@ the LAN even when IP addresses change.
 - **Demo mode** — `fleetview-master.exe --demo` opens a simulated fleet (no
   network, separate data folder) to try the app without agents.
 
-## Repository layout
+## 🗂️ Project layout
 
 | Path | What it is |
 |------|------------|
@@ -94,7 +112,7 @@ the LAN even when IP addresses change.
 | `.github/workflows/` | CI build and tagged `.exe` auto-releases. |
 | `docs/` | Setup, security and architecture notes. |
 
-## Quick start
+## 🚀 Quick start
 
 1. **Install the master** (`FleetViewMaster-Setup`). On first launch it generates
    its identity, TLS certificate and an enrollment secret.
@@ -111,7 +129,7 @@ the LAN even when IP addresses change.
 See [docs/SETUP.md](docs/SETUP.md) for the full walkthrough and
 [docs/SECURITY.md](docs/SECURITY.md) for the trust model and hardening steps.
 
-## Building from source
+## 🛠️ Building from source
 
 Requires the Rust MSVC toolchain (and Inno Setup 6 for the master installer).
 
@@ -123,7 +141,7 @@ Binaries land in `target/release/` (`fleetview-master.exe`, `fleetview-agent.exe
 The agent exe needs no installer; build the master's with `installer/master.iss`
 (see [docs/SETUP.md](docs/SETUP.md)).
 
-## Releases
+## 🏷️ Releases
 
 One version for everything: `[workspace.package] version` in `Cargo.toml`. Bump
 it, commit, then push the matching tag; `.github/workflows/release.yml` checks
@@ -136,6 +154,18 @@ git tag v0.2.0
 git push origin v0.2.0
 ```
 
-## License
+## 📚 Documentation
 
-MIT © 2026 Akulav. See [LICENSE](LICENSE).
+- [docs/SETUP.md](docs/SETUP.md): installing the master and agents, step by step
+- [docs/SECURITY.md](docs/SECURITY.md): the trust model, what to keep secret, residual risks
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the crates, the protocol and how a command travels
+
+---
+
+<div align="center">
+
+**Made with ❤️ by [Akulav](https://github.com/Akulav)**
+
+<sub>© 2026 Akulav. Source-available under the <a href="LICENSE">Akulav Source-Available License</a>.</sub>
+
+</div>

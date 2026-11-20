@@ -8,7 +8,7 @@ fn main() {
             res.set("ProductName", "FleetView Master");
             res.set("FileDescription", "FleetView Master (Made by Akulav)");
             res.set("CompanyName", "Akulav");
-            res.set("LegalCopyright", "Licensed MIT");
+            res.set("LegalCopyright", "© 2026 Akulav. Source-available license.");
             let _ = res.compile();
         }
         println!("cargo:rerun-if-changed=../installer/assets/master.ico");
